@@ -48,7 +48,6 @@ repository; there is no in-wheel rebuild path.
 from __future__ import annotations
 
 import os
-import re
 import sys
 
 # `quant_kv_v8t` does `from quant_triton import ...` as a flat top-level import
@@ -87,12 +86,6 @@ def arch_suffix(arch):
     return "." + arch
 
 
-def _arch_of(name):
-    """The inverse of `arch_suffix`: the arch tag a file name carries."""
-    m = re.search(r"\.(gfx\d{4})\.hsaco$", name)
-    return m.group(1) if m else _DEFAULT_ARCH
-
-
 def selected_arch(device=None):
     """Which object set serves `device`, or `None` if none may.
 
@@ -112,7 +105,6 @@ def selected_arch(device=None):
 #: device with `SAGEATTN_SK1_GFX1200=1` would be handed a gfx1200 object (`hipModuleLoadData`
 #: rc=209). The device chooses the object set, per call, through `_arch_now()`.
 _SEL_ARCH = _DEFAULT_ARCH
-_SUF = arch_suffix(_SEL_ARCH)
 
 
 def _arch_now(device=None):

@@ -12,11 +12,6 @@ Q is not read and `vmean` is not produced. At most two launches (`kseq_mean_*` o
 `smooth_k`, then `quant_kv_*`). Addressing is 64-bit; `strided_view_reason` stays the acceptance
 rule, so the prologue serves exactly the views the rest of SK1 accepts.
 
-`head_dim == 64` uses a second code object, `h36_prologue_d64.gfx1201.hsaco`, loaded tolerantly and
-not part of this package: when it is missing or will not load, D=64 calls refuse (`no_symbol_d64`)
-and the caller runs the Triton D=64 prologue. D=64 is fp8 Q.K only; `int8=True` at D=64 refuses
-`int8_d64` because no int8 D=64 attention object exists.
-
 Loading and launching go through `sk1_loader.HipRuntime`.
 """
 from __future__ import annotations
@@ -44,12 +39,7 @@ def hsaco_path_for(arch=None, name=None):
         return os.path.join(HERE, base)
     return os.path.join(HERE, base.replace(".gfx1201.hsaco", ".%s.hsaco" % arch))
 
-#: Separate D=64 object; it has no int8 K symbol because the int8 Q.K path is D=128-only.
-HSACO_NAME_D64 = "h36_prologue_d64.gfx1201.hsaco"
-HSACO_PATH_D64 = os.path.join(HERE, HSACO_NAME_D64)
-
 HD = 128          # the D=128 prologue
-HD_D64 = 64       # the D=64 prologue
 BN = 64           # rows per block, matches the Triton BLOCK_N=64
 NT = 256          # threads per block
 MEAN_BLOCK = (32, 8, 1)
@@ -61,16 +51,11 @@ SYMBOLS = {
     ("bf16", "f8"): "quant_kv_bf16_f8",
 }
 MEAN_SYMBOLS = {"f16": "kseq_mean_f16", "bf16": "kseq_mean_bf16"}
-SYMBOLS_D64 = {
-    ("f16", "f8"): "h36_quant_kv_f16_f8",
-    ("bf16", "f8"): "h36_quant_kv_bf16_f8",
-}
-MEAN_SYMBOLS_D64 = {"f16": "h36_kseq_mean_f16", "bf16": "h36_kseq_mean_bf16"}
 
 #: every reason `check` can return, so a test can enumerate them
 REFUSALS = ("not_cuda", "rank", "shape", "dtype_mismatch", "bf16_int8", "dtype", "head_dim",
-            "device", "n_pad", "n_lt_1", "no_symbol", "no_symbol_d64", "int8_d64", "launch",
-            "mean_launch", "mean_dtype", "mean_head_dim", "mean_no_symbol_d64") + tuple(
+            "device", "n_pad", "n_lt_1", "no_symbol", "launch",
+            "mean_launch", "mean_dtype", "mean_head_dim") + tuple(
     "k_" + r for r in ("rank", "stride_last", "stride_nonpos", "stride_align", "ptr_align",
                        "stride_overlap", "stride_int32")) + tuple(
     "v_" + r for r in ("rank", "stride_last", "stride_nonpos", "stride_align", "ptr_align",
@@ -86,7 +71,7 @@ class HipPrologue:
     """The loaded HIP prologue. `quant_kv` returns `None` (never raises) when the call is outside
     the contract or an allocation or launch fails, so the caller can run the Triton prologue."""
 
-    def __init__(self, hsaco_path=None, rt=None, hsaco_path_d64=None):
+    def __init__(self, hsaco_path=None, rt=None):
         self.path = hsaco_path or HSACO_PATH
         if not os.path.isfile(self.path):
             raise FileNotFoundError("the HIP prologue object is not built: %s "
@@ -95,18 +80,6 @@ class HipPrologue:
         self.mod = self.rt.load_module(self.path)
         self.fns = {k: self.rt.get_function(self.mod, s) for k, s in SYMBOLS.items()}
         self.means = {k: self.rt.get_function(self.mod, s) for k, s in MEAN_SYMBOLS.items()}
-        # a missing or unloadable D=64 object must not stop the D=128 prologue
-        self.path_d64 = hsaco_path_d64 or HSACO_PATH_D64
-        self.fns64, self.means64, self.d64_error = {}, {}, None
-        try:
-            if not os.path.isfile(self.path_d64):
-                raise FileNotFoundError("not built: %s" % self.path_d64)
-            self.mod64 = self.rt.load_module(self.path_d64)
-            self.fns64 = {k: self.rt.get_function(self.mod64, s) for k, s in SYMBOLS_D64.items()}
-            self.means64 = {k: self.rt.get_function(self.mod64, s)
-                            for k, s in MEAN_SYMBOLS_D64.items()}
-        except Exception as e:  # noqa: BLE001 - D=64 degrades to the Triton prologue
-            self.d64_error = "%s: %s" % (type(e).__name__, e)
         self.n_calls = 0
         self.n_refusals = 0
         self.n_mean_launches = 0
@@ -116,14 +89,8 @@ class HipPrologue:
         self._keep = collections.deque(maxlen=128)
 
     def describe(self):
-        d64 = ("%s sha256=%s symbols=%d" % (os.path.basename(self.path_d64),
-                                            _sha256(self.path_d64)[:16],
-                                            len(self.fns64) + len(self.means64))
-               if not self.d64_error else "%s UNAVAILABLE (%s)" % (os.path.basename(self.path_d64),
-                                                                   self.d64_error))
-        return "%s sha256=%s symbols=%d | D=64: %s" % (
-            os.path.basename(self.path), _sha256(self.path)[:16], len(self.fns) + len(self.means),
-            d64)
+        return "%s sha256=%s symbols=%d" % (
+            os.path.basename(self.path), _sha256(self.path)[:16], len(self.fns) + len(self.means))
 
     # ------------------------------------------------------------------ the contract
     def check(self, k, v, n_pad, int8):
@@ -142,10 +109,8 @@ class HipPrologue:
         elif k.dtype != torch.float16:
             return "dtype"
         D = int(k.shape[3])
-        if D not in (HD, HD_D64):
+        if D != HD:
             return "head_dim"
-        if D == HD_D64 and int8:
-            return "int8_d64"
         if k.device != v.device:
             return "device"
         r = strided_view_reason(k, "k")
@@ -182,10 +147,9 @@ class HipPrologue:
         if reason is not None:
             return self._refuse(reason)
         dt = "bf16" if k.dtype == torch.bfloat16 else "f16"
-        d64 = (D == HD_D64)
-        fn = (self.fns64 if d64 else self.fns).get((dt, "i8" if int8 else "f8"))
+        fn = self.fns.get((dt, "i8" if int8 else "f8"))
         if fn is None:
-            return self._refuse("no_symbol_d64" if d64 else "no_symbol")
+            return self._refuse("no_symbol")
 
         dev = k.device
         try:
@@ -226,10 +190,9 @@ class HipPrologue:
     # ------------------------------------------------------------------ the mean, on its own
     def _launch_mean(self, k, mean, N, H):
         dt = "bf16" if k.dtype == torch.bfloat16 else "f16"
-        d64 = int(k.shape[3]) == HD_D64
-        fn = (self.means64 if d64 else self.means).get(dt)
+        fn = self.means.get(dt)
         if fn is None:
-            raise RuntimeError("mean_no_symbol_d64" if d64 else "mean_no_symbol")
+            raise RuntimeError("mean_no_symbol")
         margs = [ctypes.c_void_p(k.data_ptr()), ctypes.c_void_p(mean.data_ptr()),
                  ctypes.c_int64(N), ctypes.c_int64(H),
                  ctypes.c_int64(k.stride(0)), ctypes.c_int64(k.stride(1)),
@@ -248,13 +211,11 @@ class HipPrologue:
         if k.dim() != 4 or not k.is_cuda or k.dtype not in (torch.float16, torch.bfloat16):
             return self._refuse("mean_dtype")
         B, H, N, D = (int(x) for x in k.shape)
-        if D not in (HD, HD_D64):
+        if D != HD:
             return self._refuse("mean_head_dim")
         r = strided_view_reason(k, "k")
         if r is not None:
             return self._refuse("mean_" + r)
-        if D == HD_D64 and not self.means64:
-            return self._refuse("mean_no_symbol_d64")
         try:
             mean = torch.empty((B * H, D), dtype=torch.float32, device=k.device)
             self._launch_mean(k, mean, N, H)
