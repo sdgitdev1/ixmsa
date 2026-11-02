@@ -152,7 +152,13 @@ def main():
     if rep["gfx1200_status"]:
         miss = [k for k, v in rep["gfx1200_status"]["objects"].items() if not v["present"]]
         say("gfx1200 objects  ", "ALL PRESENT" if not miss else "MISSING: %s" % ", ".join(miss))
-    say("would load       ", rep["resolved_object_names"]["SK1_HSACO_NAME_S"])
+    # The module constants are always the gfx1201 spellings; the device's own arch picks the file.
+    base = rep["resolved_object_names"]["SK1_HSACO_NAME_S"]
+    if base and rep["selected_arch"] and hasattr(SB, "object_path"):
+        rep["would_load"] = SB.object_path(base, rep["selected_arch"])
+    else:
+        rep["would_load"] = base
+    say("would load       ", rep["would_load"])
 
     if not rep.get("cuda_available"):
         rep["served"] = None
