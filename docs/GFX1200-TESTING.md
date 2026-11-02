@@ -21,7 +21,7 @@ Python. Close ComfyUI first. `--no-deps` matters, it keeps pip away from your Py
 
 ```powershell
 C:\ComfyUI\venv\Scripts\python.exe -m pip install --no-deps --force-reinstall `
-  sageattention-2.2.0+amd.gfx12.4-cp312-cp312-win_amd64.whl
+  sageattention-2.2.0+amd.gfx12.5-cp312-cp312-win_amd64.whl
 ```
 
 Use your own ComfyUI path. On the portable build the Python is `python_embeded\python.exe`.

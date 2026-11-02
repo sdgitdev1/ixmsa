@@ -16,7 +16,7 @@ Before timing, every cell checks that the hand-written kernel really serves it a
 reason when it does not. A cell that falls back is timed anyway, but its default and off columns
 then measure the same path.
 
-    python bench/bench_attention.py [--preset default|h3] [--dtype fp16|bf16]
+    python bench/bench_attention.py [--preset default|h3] [--dtype fp16|bf16] [--ck]
                                     [--reps 15] [--iters 5] [--warmup 3] [--json out.json]
 """
 import argparse
@@ -80,10 +80,16 @@ def main():
     ap.add_argument("--iters", type=int, default=5, help="calls averaged inside one timing")
     ap.add_argument("--warmup", type=int, default=3, help="untimed calls before timing a cell")
     ap.add_argument("--json", help="also write the raw samples to this file")
+    ap.add_argument("--ck", action="store_true",
+                    help="also time comfy-kitchen's int8_attention (ComfyUI's --use-ck-attention); "
+                         "non-causal rows only, since it has no causal switch")
     args = ap.parse_args()
 
     import sageattention
     from sageattention import sageattn
+    ck = None
+    if args.ck:
+        import comfy_kitchen as ck
 
     preset = PRESETS[args.preset]
     dtype_name = args.dtype or ("bf16" if args.preset == "h3" else "fp16")
@@ -110,6 +116,8 @@ def main():
                                         sk1_backend=False),
                 "sdpa": lambda: F.scaled_dot_product_attention(q, k, v, is_causal=causal),
             }
+            if ck is not None and not causal:
+                variants["ck"] = lambda: ck.int8_attention(q, k, v)
             samples = {name: [] for name in variants}
             failed = set()
             for name, fn in variants.items():
@@ -130,23 +138,29 @@ def main():
         del q, k, v
         torch.cuda.empty_cache()
 
+    ck_cols = ck is not None
     print()
     print("%6s %6s %-8s | %-25s | %-25s | %-25s | %8s %8s %9s"
           % ("N", "causal", "kernel", "sageattn default", "sageattn kernel off", "torch SDPA",
-             "off/def", "sdpa/def", "def TFLOPS"))
+             "off/def", "sdpa/def", "def TFLOPS")
+          + (" | %-25s %8s" % ("comfy-kitchen", "ck/def") if ck_cols else ""))
     for r in rows:
         s = r["samples"]
         med = {name: statistics.median(v) if v else None for name, v in s.items()}
         flops = 4.0 * heads * r["n"] * r["n"] * D * (0.5 if r["causal"] else 1.0)
         ratio = lambda a, b: "%.2fx" % (med[a] / med[b]) if med[a] and med[b] else "n/a"
         tflops = "%.1f" % (flops / (med["default"] * 1e-3) / 1e12) if med["default"] else "n/a"
-        print("%6d %6s %-8s | %-25s | %-25s | %-25s | %8s %8s %9s"
-              % (r["n"], "on" if r["causal"] else "off", "yes" if r["served"] else "NO",
-                 fmt(s["default"]), fmt(s["off"]), fmt(s["sdpa"]),
-                 ratio("off", "default"), ratio("sdpa", "default"), tflops))
+        line = ("%6d %6s %-8s | %-25s | %-25s | %-25s | %8s %8s %9s"
+                % (r["n"], "on" if r["causal"] else "off", "yes" if r["served"] else "NO",
+                   fmt(s["default"]), fmt(s["off"]), fmt(s["sdpa"]),
+                   ratio("off", "default"), ratio("sdpa", "default"), tflops))
+        if ck_cols:
+            line += (" | %-25s %8s" % (fmt(s["ck"]), ratio("ck", "default")) if "ck" in s
+                     else " | %-25s %8s" % ("n/a (causal)", ""))
+        print(line)
         if not r["served"]:
             print("%22s not served by the hand-written kernel: %s" % ("", r["reason"]))
-    print("\noff/def and sdpa/def are median ratios; above 1 means the default is faster.")
+    print("\noff/def, sdpa/def and ck/def are median ratios; above 1 means the default is faster.")
     print("TFLOPS uses 4*B*H*N^2*D flops (halved when causal) and the default variant's median.")
 
     if args.json:

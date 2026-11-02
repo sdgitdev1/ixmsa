@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover - the no-stamp fallback
     BUILD_PYTHON = "3.12.10"
     BUILD_GLIBCXX_USE_CXX11_ABI = True
     BUILD_MSVC = "14.50.35717"
-    BUILD_ID = "sageattention-gfx12/2.2.0+amd.gfx12.4"
+    BUILD_ID = "sageattention-gfx12/2.2.0+amd.gfx12.5"
     BUILD_STAMP_SOURCE = "literal"
 
 # The two extension modules that must be present for a complete install.

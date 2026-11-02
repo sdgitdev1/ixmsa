@@ -2,13 +2,14 @@
 
 This is the record of what was tried, measured and decided while porting SageAttention's quantized attention to AMD RDNA4 (gfx1201, RX 9070 XT) on Windows, with the aim of beating the existing gfx12 port in SageAttention PR #368. It lists every numbered finding and every work track. Refuted and closed results are kept next to the wins: they are what stops the next person from repeating them.
 
-The work went through five phases.
+The work went through six phases.
 
 1. **A Triton fp8 kernel.** The gap to PR #368 was diagnosed, levers were tried and closed, accuracy work was done (per-token fp8 scaling, `smooth_k`, `smooth_v`), and correctness bugs were found and fixed.
 2. **Attempts to hand-edit Triton's compiled output.**
 3. **A hand-written HIP kernel, SK1, and its variants.** `sk1_t1` (one softmax rescale per 64 keys) and `sk1_t4a1` (mask and skip work guarded by one branch) were wins; many other variants were refuted.
 4. **Shipping.** Packaging behind a flag, then default-on with fallback; a real-world fp8 overflow found when a render went black, and its fix; end-to-end tests in a diffusion model; widening the input envelope; then int8 Q·K and bf16 kernels, made the defaults in v0.2.0.
 5. **Around the kernel.** Fused-QKV views served (v0.3.0), the Triton quantization step replaced by hand-written HIP, RX 9060 XT builds behind a switch (v0.4.0), and two things that did not pay off: a second head_dim 64 kernel and ROCm 10.1.
+6. **Measured against comfy-kitchen, and a clean-up.** ComfyUI's own int8 attention turned out faster and more accurate; the full-kernel error was traced to fp8 P·V; the first call stopped importing Triton; the kernels were renamed and dead objects removed (v0.5.0).
 
 ## How to read an entry
 
@@ -1546,3 +1547,37 @@ Replacing the Triton quantization step with hand-written HIP, an independent rev
 **Result.** All eight objects the default paths use build for gfx1200 with the same compiler and flags. Their `.text` sections are byte-identical to the gfx1201 builds; only the target ID differs, and registers, LDS and kernel descriptors are identical. The gfx1200 builds are used only on a gfx1200 device and only with `SAGEATTN_SK1_GFX1200=1`, and the device always chooses its own builds. A test probe found two containment bugs before release, both fixed: setting the switch on a gfx1201 card made the loader pick the gfx1200 objects, which failed to load and then raised; and loaded objects were not dropped when the device changed. The gfx1201 results are unchanged (181/181, 184/184 and 1584/1584 bit-identical).
 
 **Status:** shipped opt in (v0.4.0); waiting for someone with the card to run [GFX1200-TESTING.md](GFX1200-TESTING.md).
+
+## 16. Measured against comfy-kitchen, and a clean-up
+
+### F167 — comfy-kitchen's int8 attention is faster <sub>(v0.5)</sub>
+
+**Question.** ComfyUI ships comfy-kitchen, whose `int8_attention` (`--use-ck-attention`, built on the PR #368 work) is what ComfyUI users on RDNA4 are told to use. How does it compare per call?
+
+**Result.** Same tensors, one process, interleaved and rotated, A/A twin within 3 %; comfy-kitchen 0.2.37, torch 2.13, B=1, D=128, non-causal. comfy-kitchen's time over this package's: 0.92 / 0.91 / 0.90 / 0.90 at N = 4096 / 8771 / 16384 / 47520 in fp16 (H=48), 0.94 / 0.93 / 0.92 / 0.92 in bf16, and 0.92 on H3's fused-QKV views at N = 27280 and 61488 (bf16, H=56). It is 6–11 % faster everywhere measured; both are 1.9–2.5× faster than PyTorch SDPA. Its design differs in P·V: Q, K and V are signed int8, the attention weights unsigned int8, with a block-Hadamard rotation of Q and K and an fp32 softmax.
+
+**Status:** open. The README says so and points ComfyUI users to it.
+
+### F168 — Full-kernel accuracy on real captures <sub>(v0.5)</sub>
+
+**Question.** F154 compared quantization schemes for Q·K in isolation. What is the full call's error, P·V included, on real activations?
+
+**Result.** Relative RMS error against fp64 SDPA on the 18 captures of F058/F154 (Krea2 blocks 0 and 26 at three timesteps, Krea2 and Klein at 1056 tokens, eight Krea2 blocks at 8771). On ordinary layers this package's error is above PR #368's path: median 0.0113 vs 0.0074 in fp16 and 0.0157 vs 0.0077 in bf16 over the eight 8771 blocks. On Krea2's first block, where a few keys are extreme, PR #368's per-block K scale breaks down (fp16: 0.025–0.175 against this package's 0.022–0.029). comfy-kitchen is lowest on 16 of 18 captures in fp16 (median 0.41× this package's error) and 15 of 18 in bf16 (0.35×). In bf16, Krea2's first block is dominated by rounding the inputs to bf16 (SDPA itself is at 0.20–0.44 there) and says nothing about the kernels. Synthetic N(0,1) data agrees: 0.038 (this package) vs 0.015 (comfy-kitchen) in fp16. The per-token int8 Q·K of F154 is still the better Q·K scheme; the fp8 e4m3 attention weights and V in P·V (3 mantissa bits) dominate the full kernel's error, so the README's earlier "no bad regime, more precise than PR #368 on all ten" overstated the full kernel and was corrected.
+
+**Status:** an 8-bit integer P·V is the next lever (research track H38).
+
+### F169 — The first call imported Triton <sub>(v0.5)</sub>
+
+**Question.** In ComfyUI's environment v0.4.0's first call took 0.48 s against 0.17 s in a plain environment. Why?
+
+**Result.** The default path imported the Triton prologue module for one integer helper, and importing Triton runs its AMD backend's `rocm-sdk` subprocess, which costs about 0.3 s where `rocm-sdk` is on PATH, as in ComfyUI. Moving the Triton imports into the fallback branches that use them: the first call in ComfyUI's environment drops to 0.076–0.079 s (3 fresh processes; v0.4.0: 0.46–0.48 s), Triton is not imported at all, and outputs are bit-identical (87 of 87 cells).
+
+**Status:** shipped (v0.5.0).
+
+### F170 — Kernel names and dead code <sub>(v0.5)</sub>
+
+**Question.** The shipped objects carried research labels (`sk1_t4a1s`, `t6in`, `h34`) and three objects nothing could route to. Can they be renamed and removed without changing what runs?
+
+**Result.** Seven objects renamed after what they do (`attn_int8qk_f16`, `attn_fp8qk_bf16_strided`, `kv_prologue`, ...; the table is in [BUILD.md](BUILD.md)), the gfx1200 suffix made uniform (`.gfx1200.hsaco`), and `sk1_t4a1`, `sk1_d64` and the never-shipped `sk1_d64b` removed with their loaders after tracing that no switch could reach them. All 14 rebuilt objects have byte-identical `.text`, VGPR, SGPR, LDS and scratch. On gfx1201 with torch 2.13: 97 of 97 tests and 87 of 87 output cells bit-identical to v0.4.0.
+
+**Status:** shipped (v0.5.0).

@@ -264,10 +264,26 @@ Three other things were tried in the same round and did not change the release:
   with the card runs it (F166). Testing the switch found two ways it could load the wrong builds;
   both were fixed before release.
 
-## 11. What is next
+## 11. A competitor in the same box
 
+For v0.5 the plan was a clean-up: name the kernels after what they do, remove the objects nothing
+could reach, and trim the comments. Measuring for it meant asking a question the project had not
+asked before. ComfyUI already ships comfy-kitchen, and its `--use-ck-attention` is what people on
+RDNA4 are pointed to. So which is better?
+
+comfy-kitchen, on both counts. It was 6–11 % faster per call, and on real activations its error was
+less than half of this package's. Looking at why turned up something the earlier accuracy work had
+missed: those comparisons were of Q·K schemes in isolation, where per-token int8 does win. End to
+end, the attention weights and V pass through fp8 with three mantissa bits, and that P·V step
+dominates the error. On ordinary layers it makes this package less precise than PR #368's path too;
+only on layers with extreme keys does the per-token Q·K still matter more (F167, F168).
+
+The clean-up shipped anyway, along with one more speed-up: the first call had been importing
+Triton for a single helper function, and Triton's AMD backend shells out to `rocm-sdk` when it
+loads. Without that import the first call in ComfyUI goes from 0.48 s to 0.08 s (F169, F170).
+
+## 12. What is next
+
+- **An 8-bit integer P·V,** the change that comfy-kitchen's numbers point to.
 - **head_dim 64** with a kernel designed for it, rather than a port of the head_dim 128 one.
-- **ROCm 10.1 / PyTorch 2.14,** once a WHQL driver runs it. An experimental pull request carries
-  the build.
-- **Linux numbers and a Linux wheel,** with community testing.
 - **An RX 9060 XT owner** to confirm the gfx1200 builds.

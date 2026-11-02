@@ -18,6 +18,11 @@ same speed. bf16 calls compute Q·K in fp8.
 ComfyUI users get it through the normal `--use-sage-attention` switch. No node and no code change
 is needed.
 
+ComfyUI also has its own int8 attention for this card, `--use-ck-attention` (comfy-kitchen, also
+built on the PR #368 work). Measured side by side for v0.5, it was 6–11 % faster per call than this
+package and had 2–4× lower error on real activations (see "Compared with comfy-kitchen" below). If
+you use ComfyUI, try it. This package stays a drop-in `sageattention` for code that calls `sageattn`.
+
 ---
 
 ## Results
@@ -74,11 +79,11 @@ two runs of the same cells disagreed by far more than the effect, so only the on
 are given. At the production sizes in the tables above the two prologues time the same within
 this card's noise (±2 %), so those numbers stand.
 
-It also needs no compiler at run time. In a fresh process in ComfyUI's environment, with an empty
-Triton cache, the first call takes 0.48 s instead of 1.9 s (PR #368's path: 0.24 s). Where Triton
-cannot build its launcher, v0.3.0's prologue could not run and calls fell back to PR #368's path;
-v0.4.0's default path does not use Triton. There is no 32-bit limit on sequence length any more
-(F162).
+It also needs no compiler at run time, and since v0.5 the default path does not even import Triton.
+In a fresh process in ComfyUI's environment the first call takes 0.08 s (v0.4.0: 0.48 s; v0.3.0,
+which compiled Triton kernels on first use: 1.9 s; PR #368's path: 0.24 s). Where Triton cannot
+build its launcher, v0.3.0's prologue could not run and calls fell back to PR #368's path. There is
+no 32-bit limit on sequence length any more (F162, F169).
 
 All of these are ratios. On this card a software clock check can confirm that the clock did not
 move during a block, but it cannot pin the absolute clock. So the absolute milliseconds are not
@@ -120,12 +125,15 @@ For fp16, Q and K are quantized to int8 and V to fp8 (e4m3), each with **one sca
 and the attention weights are folded into fp8 before the P·V product. For bf16, Q and K are fp8
 per token instead. Measured on real activations captured from Krea2 and Flux2-Klein:
 
-- **No bad regime.** PR #368 quantizes Q·K to int8 with one K scale per block of 64 tokens and one
-  Q scale per 32 rows. On layers with a few extreme keys, such as Krea2's first block, one outlier
-  sets the scale for the whole block, and its error was up to 200× this package's. Per-token
-  scaling does not have that failure mode. On ten real captures, per-token int8 with `smooth_k`
-  was more precise than PR #368 on all ten and than per-token fp8 on nine (F154). Inside real
-  Krea2 renders its per-call error is 0.82× the fp8 kernel's (F157).
+- **Where the error comes from.** Measured end to end against fp64 attention on 18 real captures,
+  this package's error on ordinary layers is about 1.5× PR #368's path in fp16 and 2× in bf16
+  (median relative RMS 0.0113 vs 0.0074 in fp16, Krea2 at 8 771 tokens). The cause is P·V: the
+  attention weights and V go through fp8 e4m3, which has 3 mantissa bits. On layers with a few
+  extreme keys, such as Krea2's first block, PR #368's one K scale per 64-token block breaks down
+  and its error reaches 4–7× this package's (0.10–0.17 vs about 0.025). The Q·K step on its own,
+  per-token int8 with `smooth_k`, is the more precise scheme on all ten captures of F154; it is
+  the fp8 P·V that dominates the full kernel's error (F168). Inside real Krea2 renders the int8
+  default's per-call error is 0.82× the fp8 kernel's (F157).
 - **`smooth_k` is on by default** and should stay on. Subtracting the per-head key mean before
   quantizing is exact in real arithmetic, and it reduced the fp8 kernel's error on 10 of 10 real
   captures, by 3.2× on average (F063). The cost is 0.4–4 % per call.
@@ -142,6 +150,32 @@ than SageAttention 1.x's: median PSNR 18.5 vs 13.5 dB at 1 MP and 21.7 vs 15.6 d
 and 23.0 vs 15.0 dB and 18.7 vs 15.0 dB in bf16. Take per-image numbers from an 8-step sampler
 with care, though. A change of 3·10⁻⁶ in the text conditioning alone moves the final latent by
 4–58 %, so single-image differences are mostly trajectory divergence, not precision.
+
+### Compared with comfy-kitchen (`--use-ck-attention`)
+
+ComfyUI ships comfy-kitchen, whose `int8_attention` is behind `--use-ck-attention`. It quantizes Q,
+K and V to int8 and the attention weights to unsigned int8, with a Hadamard rotation of Q and K
+against outliers. Measured on the same tensors, interleaved in one process (comfy-kitchen 0.2.37,
+torch 2.13, B=1, D=128, non-causal), comfy-kitchen's time divided by this package's:
+
+| | N = 4 096 | 8 771 | 16 384 | 47 520 |
+|---|---|---|---|---|
+| fp16, H=48 | 0.92 | 0.91 | 0.90 | 0.90 |
+| bf16, H=48 | 0.94 | 0.93 | 0.92 | 0.92 |
+
+MiniMax-H3's fused-QKV layout, bf16, H=56: 0.92 at N = 27 280 and 61 488.
+
+Full-call error against fp64 attention on real captures (relative RMS):
+
+| | this package | PR #368's path | comfy-kitchen |
+|---|---|---|---|
+| Krea2, 8 771 tokens, median of 8 blocks, fp16 | 0.0113 | 0.0074 | 0.0040 |
+| the same, bf16 | 0.0157 | 0.0077 | 0.0045 |
+| Krea2 block 0 (extreme keys), 4 captures, fp16 | 0.022–0.029 | 0.025–0.175 | 0.010–0.051 |
+
+comfy-kitchen had the lowest error on 16 of 18 captures in fp16 and 15 of 18 in bf16. Most of this
+package's error comes from its fp8 P·V, where comfy-kitchen uses 8-bit integers; that is the next
+thing to change here (F167, F168).
 
 ---
 
@@ -173,8 +207,8 @@ Download the wheel for your PyTorch from [Releases](../../releases) and install 
 environment that runs your models. For ComfyUI that means ComfyUI's own venv. Close ComfyUI first.
 
 ```
-python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.4-cp312-cp312-win_amd64.whl       # PyTorch 2.13
-python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.4-214-cp312-cp312-win_amd64.whl   # PyTorch 2.14
+python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.5-cp312-cp312-win_amd64.whl       # PyTorch 2.13
+python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.5-214-cp312-cp312-win_amd64.whl   # PyTorch 2.14
 ```
 
 `python -c "import torch; print(torch.__version__)"` tells you which PyTorch you have. Both wheels
@@ -267,6 +301,8 @@ per process and carries on with the fallback.
   with torch 2.9.1 and a torch 2.14 nightly, are in [docs/LINUX.md](docs/LINUX.md).
 - head_dim 128 only. Two head_dim 64 kernels were built and tested, the second on the new prologue,
   and both were slower than PR #368's, so head_dim 64 still uses the fallback (F156, F165).
+- Accuracy: on ordinary layers the full call's error is about 1.5–2× PR #368's path and 2–4×
+  comfy-kitchen's, because P·V runs in fp8 (see Accuracy).
 - On long sequences (around 47k tokens, non-causal) the int8 default is up to 1.7 % slower per
   attention call than the fp8 kernel.
 - End to end, the package has been run in Krea2 (fp16 and bf16) and MiniMax-H3 (bf16). The kernels
@@ -284,10 +320,10 @@ the whole matrix and summarized the findings. I chose what to try, read the resu
 what shipped, and nothing went in without passing the bit-for-bit and timing checks in
 docs/METHOD.md. The failures are written up next to the wins in docs/FINDINGS.md.
 
-Next up (v0.5) is head_dim 64, which still uses PR #368's kernel: two attempts came out slower,
-so it needs a new design. v0.5 also gets a clean-up pass, with clearer kernel names and fewer
-comments. After that I may patch Triton for Windows for my own use case, or send it upstream.
-Either way it is a while off -- probably a month or more.
+v0.5 is the clean-up: the kernels are named after what they do, dead code is gone, and the first
+call no longer imports Triton. Measuring against comfy-kitchen for it showed where this package
+falls short: the fp8 P·V costs accuracy. Next up is an 8-bit integer P·V, then head_dim 64, which
+needs a new design after two slower attempts. Neither is a quick job.
 
 ## Credits and license
 

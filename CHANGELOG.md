@@ -5,6 +5,29 @@ version identifier, so every wheel can be traced to the release it came from. Th
 summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them and
 [docs/METHOD.md](docs/METHOD.md) how they were taken.
 
+## v0.5.0 — 2.2.0+amd.gfx12.5
+
+**A clean-up release, measured against ComfyUI's own int8 attention. The kernels compute the same
+bytes as v0.4.0.**
+
+- **The first call no longer imports Triton.** The default path imported the Triton prologue module
+  for one helper, and importing Triton runs a `rocm-sdk` subprocess. In ComfyUI's environment the
+  first call drops from 0.48 s to 0.08 s, now below PR #368's 0.24 s.
+- **Kernels named after what they do.** `sk1_t6i` is now `attn_int8qk_f16`, `h34_prologue` is
+  `kv_prologue`, and so on, with one `.gfx1201.hsaco` / `.gfx1200.hsaco` naming scheme. The machine
+  code is byte-identical; docs/BUILD.md has the old-to-new table. Environment variables and the
+  Python API are unchanged.
+- **Dead code removed.** Three objects nothing could route to (`sk1_t4a1`, `sk1_d64`, the unshipped
+  `sk1_d64b`), their loaders, research-only kernel sources, and most of the backend's research-diary
+  comments.
+- **Compared with comfy-kitchen** (`--use-ck-attention`): it is 6–11 % faster per call and its
+  full-call error on real activations is 0.35–0.41× this package's (median). The README says so.
+- **Accuracy claims corrected.** The README's "more precise than PR #368 on all ten captures" came
+  from comparing Q·K schemes in isolation. End to end, the fp8 P·V makes this package's error about
+  1.5–2× PR #368's on ordinary layers; PR #368 is still 4–7× worse on layers with extreme keys.
+- Same two Windows wheels as v0.4.0: PyTorch `2.13.0+rocm10.0.0`, and PyTorch `2.14.0+rocm10.1.0`
+  with `-214-` in the name.
+
 ## v0.4.0 — 2.2.0+amd.gfx12.4
 
 **The quantization step before the kernel is now hand-written HIP as well, so short calls are about
