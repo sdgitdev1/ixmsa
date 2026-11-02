@@ -5,6 +5,13 @@ objects load there through `libamdhip64.so.7`
 ([#1](https://github.com/IxMxAMAR/SageAttention-RDNA4/pull/1), by
 [boxwrench](https://github.com/boxwrench)).
 
+**Prebuilt Linux wheel (community):** boxwrench publishes a v0.4.0 wheel built and tested on his
+R9700: [v0.4.0-linux-gfx1201-torch2.9.1](https://github.com/boxwrench/SageAttention-RDNA4/releases/tag/v0.4.0-linux-gfx1201-torch2.9.1),
+`sageattention-2.2.0+amd.gfx12.4-cp312-cp312-linux_x86_64.whl`, sha256
+`80fd3a69c49fb3be60b11a2bf8a5933eaab026356e3df630c89ec6aa60156b4f`. It needs exactly torch
+`2.9.1+rocm7.2.1.gitff65f5bc`, ROCm 7.2.1 and CPython 3.12; for any other torch, build from source.
+It has not been tested on this repo's own machine.
+
 | Version | GPU | OS | PyTorch | Checked |
 |---|---|---|---|---|
 | v0.2.0 | Radeon AI PRO R9700 (`gfx1201`) | Ubuntu 24.04 | `2.9.1+rocm7.2.1` | kernels load, 88/88 tests pass |
