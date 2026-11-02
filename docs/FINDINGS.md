@@ -1554,7 +1554,7 @@ Replacing the Triton quantization step with hand-written HIP, an independent rev
 
 **Question.** ComfyUI ships comfy-kitchen, whose `int8_attention` (`--use-ck-attention`, built on the PR #368 work) is what ComfyUI users on RDNA4 are told to use. How does it compare per call?
 
-**Result.** Same tensors, one process, interleaved and rotated, A/A twin within 3 %; comfy-kitchen 0.2.37, torch 2.13, B=1, D=128, non-causal. comfy-kitchen's time over this package's: 0.92 / 0.91 / 0.90 / 0.90 at N = 4096 / 8771 / 16384 / 47520 in fp16 (H=48), 0.94 / 0.93 / 0.92 / 0.92 in bf16, and 0.92 on H3's fused-QKV views at N = 27280 and 61488 (bf16, H=56). It is 6–11 % faster everywhere measured; both are 1.9–2.5× faster than PyTorch SDPA. Its design differs in P·V: Q, K and V are signed int8, the attention weights unsigned int8, with a block-Hadamard rotation of Q and K and an fp32 softmax.
+**Result.** Same tensors, one process, interleaved and rotated, A/A twin within 3 %; comfy-kitchen 0.2.40, torch 2.13, B=1, D=128, non-causal. comfy-kitchen's time over this package's: 0.92 / 0.91 / 0.90 / 0.90 at N = 4096 / 8771 / 16384 / 47520 in fp16 (H=48), 0.94 / 0.93 / 0.92 / 0.92 in bf16, and 0.92 on H3's fused-QKV views at N = 27280 and 61488 (bf16, H=56). It is 6–11 % faster everywhere measured; both are 1.9–2.5× faster than PyTorch SDPA. Its design differs in P·V: Q, K and V are signed int8, the attention weights unsigned int8, with a block-Hadamard rotation of Q and K and an fp32 softmax.
 
 **Status:** open. The README says so and points ComfyUI users to it.
 

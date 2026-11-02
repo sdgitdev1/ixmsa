@@ -155,7 +155,7 @@ with care, though. A change of 3·10⁻⁶ in the text conditioning alone moves 
 
 ComfyUI ships comfy-kitchen, whose `int8_attention` is behind `--use-ck-attention`. It quantizes Q,
 K and V to int8 and the attention weights to unsigned int8, with a Hadamard rotation of Q and K
-against outliers. Measured on the same tensors, interleaved in one process (comfy-kitchen 0.2.37,
+against outliers. Measured on the same tensors, interleaved in one process (comfy-kitchen 0.2.40,
 torch 2.13, B=1, D=128, non-causal), comfy-kitchen's time divided by this package's:
 
 | | N = 4 096 | 8 771 | 16 384 | 47 520 |
