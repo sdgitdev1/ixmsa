@@ -268,3 +268,19 @@ def test_ck_switch_routes_only_non_causal_d128_calls():
     assert on[:2] == ["True", "True"]
     assert off[:2] == ["False", "False"]
     assert on[2:] == off[2:]
+
+
+def test_default_path_does_not_import_triton():
+    # Importing Triton costs ~0.3 s where its AMD backend finds `rocm-sdk` on PATH, so the default
+    # (HIP prologue) path must not import it at all.
+    code = """
+        import sys, torch
+        from sageattention import sageattn
+        for dt in (torch.float16, torch.bfloat16):
+            q, k, v = [torch.randn(1, 8, 512, 128, device="cuda", dtype=dt) for _ in range(3)]
+            sageattn(q, k, v, tensor_layout="HND")
+            sageattn(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), tensor_layout="NHD")
+        torch.cuda.synchronize()
+        print("RESULT", "triton" in sys.modules)
+    """
+    assert _run_fresh(code, SAGEATTN_SK1_PROLOGUE="hip", SAGEATTN_CK="0") == ["False"]
