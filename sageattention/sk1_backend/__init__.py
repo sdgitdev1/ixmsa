@@ -1003,12 +1003,13 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
     # Everything below can fail for reasons that have nothing to do with the code object: a broken
     # `quant_kv_v8t` module (a partial install), an unsupported platform inside the Triton prologue, or
     # an allocation failure. The default path must therefore stay raise-free all the way to the launch.
+    # The Triton prologue modules are imported only where they are the fallback: importing Triton
+    # costs ~0.3 s on the first call where `rocm-sdk` is on PATH (its AMD backend shells out to it).
     try:
         import torch
-        from . import quant_kv_v8t as QV
         B, H, N, D = qq.shape
         sm = float(sm_scale if sm_scale is not None else D ** -0.5)
-        n_pad = QV.n_pad_for(N)
+        n_pad = (N + 63) // 64 * 64
         BH = B * H
         hp = _hip_prologue(_arch)   # `None` unless SAGEATTN_SK1_PROLOGUE=hip and it loaded
         if is_bf16:
@@ -1045,12 +1046,12 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
             # contract, same `S` staging, same launch below. The strided module also serves
             # contiguous HND (it is the 18-argument form) but the contiguous-HND cell keeps the plain
             # 12-argument object, exactly as the fp8 pair does.
-            from . import quant_kv_v8t_i8_n as QI8N
             if contiguous_hnd:
                 qr = q.reshape(BH, N, D).contiguous()
                 res = (hp.quant_kv(k, v, n_pad=n_pad, smooth_k=bool(smooth_k), int8=True)
                        if hp is not None else None)
                 if res is None:
+                    from . import quant_kv_v8t_i8_n as QI8N
                     res = QI8N.prologue_i8_fused_contig(k, v, n_pad=n_pad,
                                                         smooth_k=bool(smooth_k))
                 k8, sk, v8t, sv = res
@@ -1059,6 +1060,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 res = (hp.quant_kv(kk, vv, n_pad=n_pad, smooth_k=bool(smooth_k), int8=True)
                        if hp is not None else None)
                 if res is None:
+                    from . import quant_kv_v8t_i8_n as QI8N
                     res = QI8N.prologue_i8_fused_strided(kk, vv, n_pad=n_pad,
                                                          smooth_k=bool(smooth_k))
                 k8, sk, v8t, sv = res
@@ -1071,6 +1073,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
             res = (hp.quant_kv(k, v, n_pad=n_pad, smooth_k=bool(smooth_k), int8=False)
                    if hp is not None else None)
             if res is None:
+                from . import quant_kv_v8t as QV
                 _, _, k8, sk, v8t, sv = QV.prologue_fp8_fused(q, k, v, n_pad=n_pad,
                                                               smooth_k=bool(smooth_k))
             else:
