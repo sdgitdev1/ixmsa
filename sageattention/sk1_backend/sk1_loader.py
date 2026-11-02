@@ -234,7 +234,11 @@ class HipRuntime:
     # ---------------------------------------------------------------- module / function
     def load_module(self, hsaco):
         """`hsaco`: path or raw bytes of an `elf64-amdgpu` code object (not a `__CL` container)."""
-        image = open(hsaco, "rb").read() if isinstance(hsaco, (str, os.PathLike)) else bytes(hsaco)
+        if isinstance(hsaco, (str, os.PathLike)):
+            with open(hsaco, "rb") as f:
+                image = f.read()
+        else:
+            image = bytes(hsaco)
         if image[:4] != b"\x7fELF":
             raise RuntimeError("hipModuleLoadData wants a raw ELF; got magic %r "
                                "(unbundle the clang-offload-bundler container first)" % image[:4])
