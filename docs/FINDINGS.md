@@ -1581,3 +1581,11 @@ Replacing the Triton quantization step with hand-written HIP, an independent rev
 **Result.** Seven objects renamed after what they do (`attn_int8qk_f16`, `attn_fp8qk_bf16_strided`, `kv_prologue`, ...; the table is in [BUILD.md](BUILD.md)), the gfx1200 suffix made uniform (`.gfx1200.hsaco`), and `sk1_t4a1`, `sk1_d64` and the never-shipped `sk1_d64b` removed with their loaders after tracing that no switch could reach them. All 14 rebuilt objects have byte-identical `.text`, VGPR, SGPR, LDS and scratch. On gfx1201 with torch 2.13: 97 of 97 tests and 87 of 87 output cells bit-identical to v0.4.0.
 
 **Status:** shipped (v0.5.0).
+
+### F171 — Handing calls to comfy-kitchen, opt in <sub>(v0.6)</sub>
+
+**Question.** Given F167 and F168, should `sageattn` itself be able to serve calls with comfy-kitchen's `int8_attention`, and for which calls?
+
+**Result.** `SAGEATTN_CK=1` routes a call to comfy-kitchen when it is installed, the call is non-causal, head_dim is 128, no LSE is requested and no `sk1_backend=` is passed; its output then equals comfy-kitchen's bit for bit in both layouts. head_dim 64 stays on PR #368's path because there comfy-kitchen is more accurate but slower: its time over PR #368's is 1.10 / 1.55 / 1.02 at (H, N) = (10, 4096), (20, 1024), (10, 16384) in fp16, against relative RMS error 0.014 vs 0.037. comfy-kitchen has no causal mode. With the switch unset all 87 output cells are bit-identical to v0.4.0, and a missing comfy-kitchen gives a warning and the normal paths.
+
+**Status:** in v0.6.0, off by default.

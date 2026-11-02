@@ -266,9 +266,10 @@ tries the bf16 kernel, then PR #368's.
 | `SAGEATTN_SK1_PROLOGUE` unset | default: quantize K and V with the prebuilt HIP prologue |
 | `SAGEATTN_SK1_PROLOGUE=triton` | use v0.3.0's Triton prologue instead |
 | `SAGEATTN_SK1_GFX1200=1` | allow the hand-written kernels on an RX 9060 XT (`gfx1200`). Off by default because nobody has run them on that card yet; the device always picks its own builds, so the switch does nothing on a `gfx1201` card |
+| `SAGEATTN_CK=1` | serve non-causal head_dim 128 calls with comfy-kitchen's int8 attention, if comfy-kitchen is installed; it measured faster and more accurate there. head_dim 64 and causal calls stay on this package's paths. Off by default |
 
 The variables are read once, when the package is imported. `SAGEATTN_SK1_BACKEND=0` turns all of
-them off. The same switches exist per call: `sageattn(..., sk1_backend=, sk1_int8=, sk1_bf16=)`.
+them off, except `SAGEATTN_CK`. The same switches exist per call: `sageattn(..., sk1_backend=, sk1_int8=, sk1_bf16=)`; passing `sk1_backend=` also skips `SAGEATTN_CK`.
 
 Strict mode is about loading the kernels, not about the list above. A call outside it (a mask,
 `return_lse`, an unsupported stride pattern) still falls back silently with a switch set to `1`.
