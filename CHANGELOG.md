@@ -5,6 +5,15 @@ version identifier, so every wheel can be traced to the release it came from. Th
 summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them and
 [docs/METHOD.md](docs/METHOD.md) how they were taken.
 
+## Unreleased (v0.6)
+
+- **`SAGEATTN_CK=1`** hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it
+  is installed, since it measured faster and more accurate there (F167, F168). head_dim 64 stays on
+  PR #368's path, where comfy-kitchen is more accurate but slower (F171). Off by default.
+- The unshipped head_dim 64 prologue path and two unused helpers are gone; the loader closes the
+  code object file after reading it.
+- Default output is bit-identical to v0.5.0.
+
 ## v0.5.0 — 2.2.0+amd.gfx12.5
 
 **A clean-up release, measured against ComfyUI's own int8 attention. The kernels compute the same
