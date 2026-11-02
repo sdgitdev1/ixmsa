@@ -12,6 +12,9 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
   PR #368's path, where comfy-kitchen is more accurate but slower (F171). Off by default.
 - The unshipped head_dim 64 prologue path and two unused helpers are gone; the loader closes the
   code object file after reading it.
+- `tools/gfx1200_probe.py` now shows the object the device would actually load (it always printed
+  the gfx1201 name).
+- A test guards v0.5's first-call fix: the default path must not import Triton.
 - Default output is bit-identical to v0.5.0.
 
 ## v0.5.0 — 2.2.0+amd.gfx12.5
