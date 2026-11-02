@@ -1589,3 +1589,19 @@ Replacing the Triton quantization step with hand-written HIP, an independent rev
 **Result.** `SAGEATTN_CK=1` routes a call to comfy-kitchen when it is installed, the call is non-causal, head_dim is 128, no LSE is requested and no `sk1_backend=` is passed; its output then equals comfy-kitchen's bit for bit in both layouts. head_dim 64 stays on PR #368's path because there comfy-kitchen is more accurate but slower: its time over PR #368's is 1.10 / 1.55 / 1.02 at (H, N) = (10, 4096), (20, 1024), (10, 16384) in fp16, against relative RMS error 0.014 vs 0.037. comfy-kitchen has no causal mode. With the switch unset all 87 output cells are bit-identical to v0.4.0, and a missing comfy-kitchen gives a warning and the normal paths.
 
 **Status:** in v0.6.0, off by default.
+
+### F172 — An 8-bit integer P·V, after comfy-kitchen <sub>(track H38; research)</sub>
+
+**Question.** F168 traced this package's error to fp8 P·V. comfy-kitchen's gfx1201 code object (0.2.40, disassembled) shows how it avoids that: unsigned int8 attention weights referenced to each tile's own row max, int8 V with one scale per channel, P·V on `v_wmma_i32_16x16x16_iu8` with the output transposed, an accumulator seeded with 1.5·2^23 so the int32 result can be used as fp32 without a conversion, an integer row max (one K scale per 16 keys) and a lazy output rescale: about 4 vector ops per score element against this kernel's 8, and 182 VGPRs against 223. Can the int8 kernel adopt the P·V part?
+
+**Result.** A prototype with those P·V changes on the int8 Q·K kernel (`h38ts`; V quantized in torch, kernel time only) is 0.947 / 0.962 / 0.960 of the shipped kernel's time at N = 4096 / 8771 / 16384 (H=48, fp16, A/A within 0.5 %), with 0 spills, and its error against fp64 is 0.31–0.72× the shipped kernel's on every real capture (Krea2 block 0: 0.0079 vs 0.0248; the 8771 blocks: 0.0030–0.0105 vs 0.0049–0.0241), in line with comfy-kitchen. It fails one synthetic case: a few tokens with V 40× larger make per-channel int8 V 2.4× worse than per-token fp8 V; comfy-kitchen has the same weakness. Two lessons: `v_cvt_pk_u8_f32` already rounds to nearest, and a fixed 1/255 scale under the running max starves diffuse rows, so the tile-local reference matters.
+
+**Status:** research. Next: a V scale per (64-key block, channel) to fix the outlier case, a HIP prologue for it, then the causal and bf16 kernels.
+
+### F173 — One K scale per 16 keys, and a Hadamard rotation <sub>(track H39; research)</sub>
+
+**Question.** comfy-kitchen's integer row max needs one K scale per 16 keys. What does that buy on its own, and what does it cost in accuracy?
+
+**Result.** On the shipped int8 kernel (only Q·K changed, 219 VGPRs, no spills) it is 0.957–0.962 of the kernel's time at N = 4096–16384 (A/A within 0.3 %), but group scales cost accuracy on Krea2's first block (1.032× the shipped error). A 128-point Hadamard rotation of Q and K, applied after K's mean is subtracted (before it, block 0 breaks for every variant), brings every case back inside 1.01× and makes the 8771 blocks 1.6–4.2 % more accurate; fp16 input with fp32 accumulation is enough. Done as separate passes it costs more than it saves (full call 1.003–1.116× the shipped one). Fused into the prologue's K pass and into the kernel's Q load it is estimated at −1.5 / −3.0 / −3.4 % of the full call at N = 4096 / 8771 / 16384.
+
+**Status:** research; the fused kernel is being built.
