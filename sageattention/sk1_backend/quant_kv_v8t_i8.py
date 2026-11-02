@@ -10,7 +10,7 @@ to
 
     sk  = max(max(|k|)/127, 1e-12);   K8 = int8(clamp(rne(k/sk), -128, 127))
 
-which is what `kernels/hip/sk1_t6i.hip` expects: `SK` is `amax_k/127`, and the kernel's
+which is what `kernels/hip/attn_int8qk_f16.hip` expects: `SK` is `amax_k/127`, and the kernel's
 `c_q = sm_scale*LOG2E*(amax_q/127)` makes `acc*c_q*SK = sm_scale*LOG2E*sum(q*k)`.
 
 Rounding is round-to-nearest-even, written in pure Triton (`floor` plus the exact half-even test)

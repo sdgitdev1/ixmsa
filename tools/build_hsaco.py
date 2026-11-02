@@ -13,9 +13,19 @@ hipLaunchKernel". `hipcc --genco` is not used because it writes a `clang-offload
 `-nogpuinc` must not be used either, because `__global__` and `__launch_bounds__` come from the HIP
 headers.
 
-`--arch gfx1200` runs the same recipe with `gfx1200` in both places and writes `<name>_1200.hsaco`,
+`--arch gfx1200` runs the same recipe with `gfx1200` in both places and writes `<name>.gfx1200.hsaco`,
 the file names `sageattention.sk1_backend` loads for a gfx1200 device. The sources and flags are
-identical; only the target changes. The gfx1200 set has no `sk1_d64`, which is not routed.
+identical; only the target changes.
+
+The shipped objects, one per source in `kernels/hip/`:
+
+    attn_fp8qk_f16             fp16 Q/O, fp8 Q.K, contiguous HND
+    attn_fp8qk_f16_strided     the same with Q/O strides (strided HND and NHD)
+    attn_fp8qk_bf16            bf16 Q/O, fp8 Q.K, contiguous HND
+    attn_fp8qk_bf16_strided    the same with Q/O strides
+    attn_int8qk_f16            fp16 Q/O, int8 Q.K, contiguous HND
+    attn_int8qk_f16_strided    the same with Q/O strides
+    kv_prologue                the KV quantisation prologue
 
 No GPU is needed: the build runs with `HIP_VISIBLE_DEVICES=-1` and never initialises the runtime.
 
@@ -33,11 +43,11 @@ The compiler is found, in order, from:
 Usage:
 
     python tools/build_hsaco.py                  # rebuild all shipped gfx1201 objects in place
-    python tools/build_hsaco.py --arch gfx1200   # rebuild the gfx1200 set (*_1200.hsaco)
+    python tools/build_hsaco.py --arch gfx1200   # rebuild the gfx1200 set (*.gfx1200.hsaco)
     python tools/build_hsaco.py --out-dir build  # write them elsewhere
     python tools/build_hsaco.py --check          # build to a temp dir and compare with the shipped files
-    python tools/build_hsaco.py sk1_t4a1s        # only some kernels
-    python tools/build_hsaco.py h34_prologue     # only the HIP KV prologue
+    python tools/build_hsaco.py attn_fp8qk_f16  # only some kernels
+    python tools/build_hsaco.py kv_prologue    # only the HIP KV prologue
 
 The object embeds a symbol `__hip_cuid_<hash>` whose name changes with the source text (even a
 comment), so the files are not byte-identical after a comment edit. `--check` therefore compares
@@ -58,9 +68,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KERNEL_DIR = os.path.join(ROOT, "kernels", "hip")
 PACKAGE_DIR = os.path.join(ROOT, "sageattention", "sk1_backend")
 ARCHS = ("gfx1201", "gfx1200")
-SHIPPED = ("sk1_t4a1", "sk1_t4a1s", "sk1_t4a1n", "sk1_t6i", "sk1_t6in", "sk1_t4a1sb", "sk1_t4a1nb",
-           "sk1_d64", "h34_prologue")
-NOT_GFX1200 = ("sk1_d64",)
+SHIPPED = ("attn_fp8qk_f16", "attn_fp8qk_f16_strided", "attn_fp8qk_bf16", "attn_fp8qk_bf16_strided",
+           "attn_int8qk_f16", "attn_int8qk_f16_strided", "kv_prologue")
 
 
 def exe(name):
@@ -97,10 +106,8 @@ def find_llvm_bin():
 
 
 def hsaco_name(name, arch):
-    """`<name>.gfx1201.hsaco` for gfx1201, `<name>_1200.hsaco` for gfx1200."""
-    if arch == "gfx1201":
-        return "%s.%s.hsaco" % (name, arch)
-    return "%s_%s.hsaco" % (name, arch.replace("gfx", ""))
+    """`<name>.<arch>.hsaco`, e.g. `<name>.gfx1201.hsaco`."""
+    return "%s.%s.hsaco" % (name, arch)
 
 
 def build(llvm_bin, name, out_dir, arch):
@@ -163,8 +170,7 @@ def main():
                     help="build into a temporary directory and compare with the files in "
                          "sageattention/sk1_backend instead of writing")
     args = ap.parse_args()
-    kernels = args.kernels or [k for k in SHIPPED
-                               if args.arch == "gfx1201" or k not in NOT_GFX1200]
+    kernels = args.kernels or SHIPPED
 
     llvm_bin = find_llvm_bin()
     print("compiler:", os.path.join(llvm_bin, exe("clang")))
@@ -178,17 +184,17 @@ def main():
                 fresh = build(llvm_bin, name, tmp, args.arch)
                 shipped = os.path.join(PACKAGE_DIR, os.path.basename(fresh))
                 if not os.path.isfile(shipped):
-                    print("%-12s no shipped file to compare" % name)
+                    print("%-24s no shipped file to compare" % name)
                     status = 1
                 elif code_sections(llvm_bin, fresh) == code_sections(llvm_bin, shipped):
-                    print("%-12s .text/.rodata/.note identical to the shipped object" % name)
+                    print("%-24s .text/.rodata/.note identical to the shipped object" % name)
                 else:
-                    print("%-12s DIFFERS from the shipped object" % name)
+                    print("%-24s DIFFERS from the shipped object" % name)
                     status = 1
     else:
         for name in kernels:
             out = build(llvm_bin, name, args.out_dir, args.arch)
-            print("%-12s -> %s (%d bytes)" % (name, out, os.path.getsize(out)))
+            print("%-24s -> %s (%d bytes)" % (name, out, os.path.getsize(out)))
     return status
 
 

@@ -1,16 +1,5 @@
-// SK1 T4a1n: T4a1s plus generalised Q/O addressing (explicit row/head/batch strides).
-// Derived from sk1_t4a1s.hip by literal string substitution.
-//
-// Why: `sk1_t4a1s` hard-codes `Q + (bh*N + qrow)*HD + d` and `O[(bh*N + row)*HD + d]`,
-// which is the contiguous (B*H, N, HD) HND address only.  ComfyUI hands sage attention
-// either a non-contiguous HND `rearrange` view or NHD `(B, N, H, D)` q/k/v, and
-// `sk1_t4a1s` cannot take either.  This kernel takes the (row, head, batch) element
-// strides as three integers, so the plane base is `blockIdx.z*bs + blockIdx.y*hs` instead
-// of `bh*N*HD`.
-// With (rs, hs, bs) = (HD, N*HD, H*N*HD) the address is identical to sk1_t4a1s's, and
-// the KV loop / softmax / folds / masks are unchanged, so a strided or NHD call is
-// bit-identical to sk1_t4a1s on the same data made contiguous HND.
-// The `p*amax_v` overflow fix is inherited unchanged from sk1_t4a1s.
+// fp8 Q.K attention, fp16 Q/O, contiguous HND: the per-(b,h) `S` rescale removes the `p*amax_v` fp8
+// overflow.
 //
 // The bug: the P fold is `p8 = e4m3(p * sv * 448) = e4m3(p * max(amax_v,1))` with p <= 1
 // and no clamp (see the P fold below).  amax_v is unbounded, so any key token with
@@ -19,23 +8,22 @@
 // argument; the prologue stages SV' = sv/S, so the kernel's unchanged `sr = SV'*448` is
 // amax_v/S <= 448 for every key, and the epilogue carries the compensating `x S`.
 // S == 1.0f exactly iff every amax_v <= 448 => SV' == SV bit-for-bit and
-// fl(1.0f/x) == fl(1.0f/x) => bit-identical to sk1_t4a1 on every |V| <= 448 input.
-// Base: sk1_t1.hip, with a few literal string substitutions.
+// fl(1.0f/x) == fl(1.0f/x) => bit-identical to the kernel without the `S` argument on every |V| <= 448 input.
 //
 // Base: an earlier kernel with hoisted LDS base pointers and the x448 folded into the staged SV.
 // Structure change in the KV loop, for each 64-key tile j:
 //   phase 1: QK for BOTH 32-key sub-tiles, scale + mask, ONE row max over all 64 keys;
 //   phase 2: ONE m_use / ONE alpha = exp2(m_i - m_use), ONE l_i update, ONE acc *= alpha;
 //   phase 3: PV for both sub-tiles.
-// Mathematically identical to sk1 (sum exp2(x - m) is exact under a common shift); the ROUNDING
+// Mathematically identical to the per-32-key form (sum exp2(x - m) is exact under a common shift); the ROUNDING
 // differs because the running max advances once per 64 keys instead of once per 32.
 //
 // An earlier attempt at this restructuring held all loads live and compiled to 256 VGPR with spills.  Here the K
 // fragments are transient inside the QK loops, the scale vectors die per 16-key tile, and the
 // `amdgpu_waves_per_eu(6,6)` attribute asks the register allocator for 6 waves/SIMD32 (<=240 VGPR).
 //
-// Same interface and numerics contract as sk1.hip, plus the `S` argument and six
-// stride integers; symbols sk1t4a1n_attn_fwd_c0 / _c1.
+// Same numerics contract as the per-32-key form, plus the `S` argument;
+// symbols attn_fp8qk_f16_fwd / _fwd_causal.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -66,13 +54,11 @@ __device__ __forceinline__ f32x8 wmma(i32x2 a, i32x2 b, f32x8 c) {
 }
 
 template <bool CAUSAL>
-__device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
+__device__ __forceinline__ void attn_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
                                            const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
                                            const float* __restrict__ SV, const float* __restrict__ VMEAN,
                                            const float* __restrict__ S,
-                                           _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale,
-                                           int q_rstride, int q_hstride, int q_bstride,
-                                           int o_rstride, int o_hstride, int o_bstride) {
+                                           _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale) {
   __shared__ __attribute__((aligned(16))) uint8_t sK[2][BN * KSTRIDE];
   __shared__ __attribute__((aligned(16))) uint8_t sV[2][HD * VSTRIDE];
   __shared__ __attribute__((aligned(16))) float sS[2][BN];
@@ -81,15 +67,6 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lr = lane & 15, lh = lane >> 4;
   const int start_m = blockIdx.x;
   const size_t bh = (size_t)blockIdx.z * H + blockIdx.y;
-  // Generalised (b,h) addressing for Q and O.  `q_rstride` is the element stride
-  // between consecutive query ROWS, `q_hstride` between consecutive HEADS and
-  // `q_bstride` between consecutive BATCHES, so the plane base is not `bh*N*HD` in
-  // general.  For a contiguous HND (B,H,N,D) tensor (rs,hs,bs) = (HD, N*HD, H*N*HD) and
-  // both addresses below reduce EXACTLY to the sk1_t4a1s form.
-  const size_t qbase = (size_t)blockIdx.z * (size_t)q_bstride
-                     + (size_t)blockIdx.y * (size_t)q_hstride;
-  const size_t obase = (size_t)blockIdx.z * (size_t)o_bstride
-                     + (size_t)blockIdx.y * (size_t)o_hstride;
   // The per-(b,h) rescale the prologue applied to SV.  CTA-uniform, one load.
   const float Sb = S[bh];
   const int q0 = start_m * BM + w * 16;
@@ -101,7 +78,7 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   // ---- Q: raw fp16 -> e4m3, per-token scale, 8 B fragments ----
   f16x8 qh[8];
   float amax = 0.f;
-  const _Float16* qp = Q + qbase + (size_t)qrow * (size_t)q_rstride + 8 * lh;
+  const _Float16* qp = Q + (bh * N + qrow) * HD + 8 * lh;
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
     if (qrow < N) {
@@ -303,28 +280,23 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const int row = q0 + 8 * lh + e;
-      if (row < N) O[obase + (size_t)row * (size_t)o_rstride + d]
-          = (_Float16)(acc[nt][e] * inv[e] + vm);
+      if (row < N) O[(bh * N + row) * HD + d] = (_Float16)(acc[nt][e] * inv[e] + vm);
     }
   }
 }
 
-#define SK1T1_ARGS                                                                                \
+#define ATTN_ARGS                                                                                \
   const _Float16 *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,   \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
       const float *__restrict__ S, \
-      _Float16 *__restrict__ O, int H, int N, int N_pad, float sm_scale, \
-      int q_rstride, int q_hstride, int q_bstride, \
-      int o_rstride, int o_hstride, int o_bstride
+      _Float16 *__restrict__ O, int H, int N, int N_pad, float sm_scale
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1n_attn_fwd_c0(SK1T1_ARGS) {
-  sk1t1_body<false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
+attn_fp8qk_f16_fwd(ATTN_ARGS) {
+  attn_body<false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1n_attn_fwd_c1(SK1T1_ARGS) {
-  sk1t1_body<true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
+attn_fp8qk_f16_fwd_causal(ATTN_ARGS) {
+  attn_body<true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }

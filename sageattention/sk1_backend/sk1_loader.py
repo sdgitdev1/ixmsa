@@ -411,41 +411,40 @@ class Sk1Attn:
     `H` is the head count used to fold (b, h) out of `bh`; N_pad must be a multiple of 64.
 
     `qo_dtype` is the Q/O element dtype this object was built for. It defaults from the symbol pair
-    (`sk1t4a1sb`/`sk1t4a1nb` -> `torch.bfloat16`, everything else -> `torch.float16`), so the dtype
+    (`attn_fp8qk_bf16*` -> `torch.bfloat16`, everything else -> `torch.float16`), so the dtype
     contract is per object: the fp16 objects refuse a bf16 call and the bf16 objects refuse an fp16
     one. `__bf16` and `_Float16` are both 16 bits wide, so the vector load, the addresses and the
     whole KV loop are identical; only the widen and the narrow differ.
 
-    The `sk1_t4a1s` object takes a 12th argument, `S` (B*H,) fp32: the per-`(b,h)` rescale
+    Every packaged object takes a 12th argument, `S` (B*H,) fp32: the per-`(b,h)` rescale
     `S = clamp_min(max_j sv(j), 1)` that the prologue applied to `SV`. It is inserted between `VMEAN`
     and `O`, so the kernel argument order is `Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale`.
-    `with_s` selects it; it defaults to `True` for the `sk1_t4a1s` symbol pair and `False` otherwise,
-    so the 11-argument `sk1_t4a1` keeps working.
+    `with_s` selects it and defaults to `True`.
     """
 
-    #: The default symbols are the `sk1_t4a1` pair. `sk1_t1`'s pair is
-    #: `("sk1t1_attn_fwd_c0", "sk1t1_attn_fwd_c1")`; the `sk1_t4a1s` pair is
-    #: `("sk1t4a1s_attn_fwd_c0", "sk1t4a1s_attn_fwd_c1")` and takes `S`.
-    DEFAULT_SYMBOLS = ("sk1t4a1_attn_fwd_c0", "sk1t4a1_attn_fwd_c1")
+    #: The default symbols are the `attn_fp8qk_f16` pair.
+    DEFAULT_SYMBOLS = ("attn_fp8qk_f16_fwd", "attn_fp8qk_f16_fwd_causal")
 
-    #: The argument order of the `sk1_t4a1s` kernel, checked against its emitted ISA:
+    #: The argument order of the `attn_fp8qk_f16` kernel, checked against its emitted ISA:
     #: `s_load_b512 s[0:15], s[0:1], 0x0` covers Q..O at offsets 0x00..0x3F and
     #: `s_load_b128 s[16:19], s[0:1], 0x40` covers H, N, N_pad and sm.
     ARG_ORDER_WITH_S = ("Q", "K8", "SK", "V8T", "SV", "VMEAN", "S", "O", "H", "N", "N_pad", "sm")
 
-    #: The widened object `sk1_t4a1n` takes six extra integers after `sm_scale`: the
-    #: `(row, head, batch)` element strides of `Q` and of `O` (see `kernels/hip/sk1_t4a1n.hip`).
+    #: The widened object `attn_fp8qk_f16_strided` takes six extra integers after `sm_scale`: the
+    #: `(row, head, batch)` element strides of `Q` and of `O` (see
+    #: `kernels/hip/attn_fp8qk_f16_strided.hip`).
     #: With `(q_rs, q_hs, q_bs) = (128, N*128, H*N*128)` and the same for `O`, the kernel's addresses
-    #: are identical to `sk1_t4a1s`'s. Contiguous HND is still routed to `sk1_t4a1s` (routing is in
+    #: are identical to `attn_fp8qk_f16`'s. Contiguous HND is still routed to `attn_fp8qk_f16` (routing is in
     #: `__init__.py`), so that path keeps its original code object.
     ARG_ORDER_STRIDED = ("Q", "K8", "SK", "V8T", "SV", "VMEAN", "S", "O", "H", "N", "N_pad", "sm",
                          "q_rs", "q_hs", "q_bs", "o_rs", "o_hs", "o_bs")
 
     def __init__(self, hsaco_path: str, rt: HipRuntime | None = None, symbols=None, with_s=None,
                  strided=None, head_dim=None, bm=None, qo_dtype=None):
-        """`symbols` = (non-causal, causal) entry points.  The packaged default is the `sk1_t4a1`
-        variant's pair (`sk1t4a1_attn_fwd_c0/_c1`); the `_check` contract guard runs before every
-        launch.  `with_s` selects the 12-argument form (see the class doc).
+        """`symbols` = (non-causal, causal) entry points.  The packaged default is the
+        `attn_fp8qk_f16` pair (`attn_fp8qk_f16_fwd` / `attn_fp8qk_f16_fwd_causal`); the `_check`
+        contract guard runs before every launch.  `with_s` selects the 12-argument form (see the
+        class doc).
 
         `head_dim` (64 or 128) and `bm` (128 or 256) both default from the symbol pair, for the same
         reason `with_s`/`strided` do: a caller that only swaps `symbols` must not be able to launch a
@@ -460,33 +459,22 @@ class Sk1Attn:
         self.symbols = tuple(symbols) if symbols else self.DEFAULT_SYMBOLS
         if len(self.symbols) != 2:
             raise ValueError("symbols must be (non-causal, causal); got %r" % (self.symbols,))
-        # `with_s` defaults from the symbol pair, so a caller that only changes `symbols` cannot
-        # silently launch the 12-argument kernel with 11 arguments (a GPU page fault).
-        # The D=64 objects are the 18-argument strided form with `S`, so `d64` implies both. `d64`
-        # appears in no D=128 symbol, so the D=128 inference is unchanged.
-        self.with_s = (any("t4a1s" in s or "d64" in s for s in self.symbols) if with_s is None
-                       else bool(with_s))
-        # Same guard for the six-stride form: defaulting from the symbol pair means a caller that
-        # only swaps `symbols` cannot launch the 18-argument kernel with 12 arguments.
-        self.strided = (any("t4a1n" in s or "d64" in s for s in self.symbols) if strided is None
-                        else bool(strided))
-        # Head dim and query-tile height, likewise inferred from the symbol pair.
-        inferred_d = 64 if any("d64" in s for s in self.symbols) else 128
-        self.head_dim = int(inferred_d if head_dim is None else head_dim)
+        # Every packaged object takes `S`, so `with_s` defaults to True.
+        self.with_s = True if with_s is None else bool(with_s)
+        # The six-stride form is inferred from the symbol pair: a caller that only swaps `symbols`
+        # cannot launch the 18-argument kernel with 12 arguments.
+        self.strided = ("_strided_" in self.symbols[0]) if strided is None else bool(strided)
+        # Head dim and query-tile height default to the only packaged shape (D=128, BM=128).
+        self.head_dim = int(128 if head_dim is None else head_dim)
         if self.head_dim not in (64, 128):
             raise ValueError("head_dim must be 64 or 128; got %d" % self.head_dim)
-        inferred_bm = 256 if any("d64m" in s for s in self.symbols) else 128
-        self.bm = int(inferred_bm if bm is None else bm)
+        self.bm = int(128 if bm is None else bm)
         if self.bm not in (128, 256):
             raise ValueError("bm must be 128 or 256; got %d" % self.bm)
-        # The Q/O element dtype, inferred from the symbol pair. The D=64 bf16 symbols are
-        # `sk1d64bf` / `sk1d64wbf` / `sk1d64mbf`, which do not contain `t4a1sb`, so that pair needs
-        # its own test. No fp16 D=64 symbol contains "bf", so "d64" with "bf" is unambiguous.
+        # The Q/O element dtype, inferred from the symbol pair.
         if qo_dtype is None:
             import torch
-            qo_dtype = (torch.bfloat16 if any(("t4a1sb" in s) or ("t4a1nb" in s)
-                                              or ("d64" in s and "bf" in s)
-                                              for s in self.symbols) else torch.float16)
+            qo_dtype = (torch.bfloat16 if any("bf16" in s for s in self.symbols) else torch.float16)
         self.qo_dtype = qo_dtype
         self.module = self.rt.load_module(hsaco_path)
         self.funcs = {sym: self.rt.get_function(self.module, sym) for sym in self.symbols}
@@ -581,7 +569,7 @@ class Sk1Attn:
         bh = B * H
         qtr = _strided_triple(q, "q")
         otr = _strided_triple(out, "out")
-        # The Q load is a 16-byte `f16x8` (see `sk1_t4a1n.hip`), so every (b,h,row) start must be
+        # The Q load is a 16-byte `f16x8` (see `attn_fp8qk_f16_strided.hip`), so every (b,h,row) start must be
         # 16-byte aligned: an 8-element multiple on each stride plus an aligned base pointer.
         for nm, tr in (("q", qtr), ("out", otr)):
             rs, hs, bs = tr[0], tr[1], tr[2]

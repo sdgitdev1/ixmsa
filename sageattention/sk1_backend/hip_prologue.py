@@ -1,11 +1,11 @@
 """The HIP KV prologue: a ctypes-launched code object that replaces the Triton prologue on the
-default SK1 paths. Source: `kernels/hip/h34_prologue.hip`.
+default SK1 paths. Source: `kernels/hip/kv_prologue.hip`.
 
 A second code object, `h36_prologue_d64.gfx1201.hsaco`, covers `head_dim == 64`. It is loaded
 tolerantly and is not part of this package: when it is missing or will not load, D=64 calls refuse
 (`no_symbol_d64`) and the caller runs the Triton D=64 prologue, while the D=128 object is unaffected.
 D=64 is fp8 Q.K only. `int8=True` at D=64 refuses `int8_d64`, because the int8 Q.K objects are the
-D=128-only `sk1_t6i` / `sk1_t6in` and no int8 D=64 attention object exists.
+D=128-only `attn_int8qk_f16` / `attn_int8qk_f16_strided` and no int8 D=64 attention object exists.
 
 It produces exactly the four tensors the SK1 attention objects consume, and nothing else:
 
@@ -18,7 +18,7 @@ It produces exactly the four tensors the SK1 attention objects consume, and noth
 `fold_v_scale(sv)` in torch. No Q is read: the fp8-contiguous Triton prologue's `quant_rows_fp8(q)`
 result is discarded.
 
-Two launches at most (`h34_kseq_mean_*` only when `smooth_k`, then `h34_quant_kv_*`), against 1-4
+Two launches at most (`kseq_mean_*` only when `smooth_k`, then `quant_kv_*`), against 1-4
 Triton launches otherwise. All addressing inside the kernels is 64-bit, so the prologue itself has no
 2^31-element offset limit; `strided_view_reason` is still the acceptance rule, so the prologue serves
 exactly the views the rest of SK1 accepts.
@@ -37,7 +37,7 @@ import torch
 from .sk1_loader import HipRuntime, strided_view_reason, torch_stream
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-HSACO_NAME = "h34_prologue.gfx1201.hsaco"
+HSACO_NAME = "kv_prologue.gfx1201.hsaco"
 HSACO_PATH = os.path.join(HERE, HSACO_NAME)
 
 
@@ -45,17 +45,17 @@ def hsaco_path_for(arch=None, name=None):
     """The D=128 prologue object for `arch` (`""` / `None` / `gfx1201` -> the gfx1201 object).
 
     The prologue is a code object like the attention objects, so it is per-arch:
-    `h34_prologue.gfx1201.hsaco` / `h34_prologue_1200.hsaco`. The symbols are identical (same
+    `kv_prologue.gfx1201.hsaco` / `kv_prologue.gfx1200.hsaco`. The symbols are identical (same
     source, same commands, only `--offload-arch` differs), so only the path changes.
     """
     base = name or HSACO_NAME
     if arch in (None, "", "gfx1201"):
         return os.path.join(HERE, base)
-    return os.path.join(HERE, base.replace(".gfx1201.hsaco", "_%s.hsaco" % arch.replace("gfx", "")))
+    return os.path.join(HERE, base.replace(".gfx1201.hsaco", ".%s.hsaco" % arch))
 
 #: The D=64 object is a separate code object, so the D=128 object and its sha256 are unaffected by
-#: it. It has no int8 K symbol on purpose: the int8 Q.K path is the D=128-only `sk1_t6i` /
-#: `sk1_t6in` pair, so every D=64 call that reaches a prologue is fp8 Q.K (`check` refuses
+#: it. It has no int8 K symbol on purpose: the int8 Q.K path is the D=128-only `attn_int8qk_f16` /
+#: `attn_int8qk_f16_strided` pair, so every D=64 call that reaches a prologue is fp8 Q.K (`check` refuses
 #: `int8=True` with `int8_d64`).
 HSACO_NAME_D64 = "h36_prologue_d64.gfx1201.hsaco"
 HSACO_PATH_D64 = os.path.join(HERE, HSACO_NAME_D64)
@@ -68,11 +68,11 @@ MEAN_BLOCK = (32, 8, 1)
 
 #: (input dtype tag, K quantiser) -> symbol
 SYMBOLS = {
-    ("f16", "i8"): "h34_quant_kv_f16_i8",
-    ("f16", "f8"): "h34_quant_kv_f16_f8",
-    ("bf16", "f8"): "h34_quant_kv_bf16_f8",
+    ("f16", "i8"): "quant_kv_f16_i8",
+    ("f16", "f8"): "quant_kv_f16_f8",
+    ("bf16", "f8"): "quant_kv_bf16_f8",
 }
-MEAN_SYMBOLS = {"f16": "h34_kseq_mean_f16", "bf16": "h34_kseq_mean_bf16"}
+MEAN_SYMBOLS = {"f16": "kseq_mean_f16", "bf16": "kseq_mean_bf16"}
 #: D=64 has no int8 K variant (there is no int8 D=64 attention object to feed)
 SYMBOLS_D64 = {
     ("f16", "f8"): "h36_quant_kv_f16_f8",

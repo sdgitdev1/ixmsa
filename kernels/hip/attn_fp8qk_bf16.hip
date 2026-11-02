@@ -1,14 +1,17 @@
-// SK1 T6i: T4a1s with int8 Q.K.  Derived from sk1_t4a1s.hip by literal string substitution.
+// attn_fp8qk_f16 with the Q/O element type as a template parameter, so the same kernel source
+// serves fp16 and bf16.  Derived from attn_fp8qk_f16.hip by literal string substitution.
 //
-// Q and K are quantised per token to int8 (scale = amax/127, round to nearest even, clamp to
-// [-128,127]).  K is quantised by the prologue after smooth_k; Q is quantised in the kernel per
-// query row, the same way T4a1s does it for e4m3.  Q.K runs on v_wmma_i32_16x16x16_iu8 with int32
-// accumulators, converted once to fp32 with the product of the two scales.  The operand fragment
-// layout is byte-identical to the fp8 path (checked against the int8 K and Q packing in PR #368's
-// qk_int_sv_gfx12_native.cu), so the LDS staging, the fragment loads and everything from the
-// softmax onward are unchanged.  The per-(b,h) `S` rescale and the three-phase KV loop are
-// described in sk1_t4a1s.hip.
-// Symbols sk1t6i_attn_fwd_c0 / _c1.
+// bf16 and fp16 are both 16 bits wide, so the Q vector load, every address and the whole KV loop
+// are unchanged.  The only two dtype-dependent operations are the Q widen `(float)qh[..]` and the O
+// narrow `(T)(acc*inv + vm)`; K, V and P are e4m3 and every scale is fp32, so the quantisation
+// arithmetic is the same text for both.  clang emits the same `global_load_b128` for a bf16 vector
+// load as for fp16, widens bf16 to fp32 by bit placement (no `v_cvt`), and narrows fp32 to bf16
+// with a 5-VALU round-to-nearest-even sequence plus `global_store_d16_hi_b16`.
+//
+// Four entry points: `attn_fp8qk_f16_fwd/_fwd_causal` are the `_Float16` instantiation, kept so its code
+// can be compared against a build of attn_fp8qk_f16.hip, and
+// `attn_fp8qk_bf16_fwd/_fwd_causal` are `__bf16`.  The per-(b,h) `S` rescale and the three-phase KV loop
+// are described in attn_fp8qk_f16.hip.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -17,8 +20,14 @@ typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x8 __attribute__((ext_vector_type(8)));
-typedef int      i32x8 __attribute__((ext_vector_type(8)));
 typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
+typedef __bf16   bf16x8 __attribute__((ext_vector_type(8)));
+
+// The Q/O element type.  bf16 and fp16 are both 16 bits wide, so the vector load and every
+// address are unchanged; only the widen (T -> f32) and the narrow (f32 -> T) differ.
+template <typename T> struct QOVec;
+template <> struct QOVec<_Float16> { typedef f16x8 type; };
+template <> struct QOVec<__bf16>   { typedef bf16x8 type; };
 
 #define BM 128
 #define BN 64
@@ -26,7 +35,6 @@ typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
 #define KSTRIDE 152
 #define VSTRIDE 72
 #define P_SCALE 448.0f
-#define I8_MAX 127.0f
 #define LOG2E 1.4426950408889634f
 
 __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
@@ -36,42 +44,16 @@ __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
 
 __device__ __forceinline__ float clamp448(float x) { return fminf(fmaxf(x, -P_SCALE), P_SCALE); }
 
-// int8 clamp.  The caller rounds to nearest even first, as PR #368's float_to_int8_nearby_gfx12 does.
-__device__ __forceinline__ float clamp127(float x) { return fminf(fmaxf(x, -128.0f), 127.0f); }
-
-// Pack 4 already-integral floats into 4 int8 in one VGPR.
-//   __builtin_rintf -> v_rndne_f32 (round to nearest even, the same tie rule as nearbyintf and
-//                      torch.round; v_cvt_pk_i16_f32 truncates, so the rounding must happen in
-//                      float first).
-//   (int)           -> v_cvt_i32_f32, truncation, which is exact on an already-integral float.
-// clang does not declare __builtin_amdgcn_cvt_pk_i16_f32 for gfx1201, and the bias and byte-select
-// semantics of cvt_pk_u8_f32 do not fit, so the bytes are assembled with plain ALU ops.  This runs
-// once per lane (16 groups) against a KV loop of ~778 instructions per tile, so it is off the hot
-// path.
-__device__ __forceinline__ int pk4i(float a, float b, float c, float d) {
-  const int ia = (int)__builtin_rintf(a);
-  const int ib = (int)__builtin_rintf(b);
-  const int ic = (int)__builtin_rintf(c);
-  const int id = (int)__builtin_rintf(d);
-  return (ia & 0xff) | ((ib & 0xff) << 8) | ((ic & 0xff) << 16) | ((id & 0xff) << 24);
-}
-
-// Signed int8 x signed int8 -> int32, no negation, signed accumulator.  The argument order is
-// (signA, A, signB, B, C, signAcc).
-__device__ __forceinline__ i32x8 wmma_i8(i32x2 a, i32x2 b, i32x8 c) {
-  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, true);
-}
-
 __device__ __forceinline__ f32x8 wmma(i32x2 a, i32x2 b, f32x8 c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
 }
 
-template <bool CAUSAL>
-__device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
+template <bool CAUSAL, typename T>
+__device__ __forceinline__ void attn_body(const T* __restrict__ Q, const uint8_t* __restrict__ K8,
                                            const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
                                            const float* __restrict__ SV, const float* __restrict__ VMEAN,
                                            const float* __restrict__ S,
-                                           _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale) {
+                                           T* __restrict__ O, int H, int N, int N_pad, float sm_scale) {
   __shared__ __attribute__((aligned(16))) uint8_t sK[2][BN * KSTRIDE];
   __shared__ __attribute__((aligned(16))) uint8_t sV[2][HD * VSTRIDE];
   __shared__ __attribute__((aligned(16))) float sS[2][BN];
@@ -88,32 +70,33 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   const int j_hi = CAUSAL ? min(n_tiles, 2 * start_m + 2) : n_tiles;
   const int full = CAUSAL ? 2 * start_m : n_tiles;
 
-  // ---- Q: raw fp16 -> e4m3, per-token scale, 8 B fragments ----
-  f16x8 qh[8];
+  // ---- Q: raw T -> e4m3, per-token scale, 8 B fragments ----
+  typedef typename QOVec<T>::type qovec;
+  qovec qh[8];
   float amax = 0.f;
-  const _Float16* qp = Q + (bh * N + qrow) * HD + 8 * lh;
+  const T* qp = Q + (bh * N + qrow) * HD + 8 * lh;
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
     if (qrow < N) {
-      qh[dt] = *(const f16x8*)(qp + 16 * dt);
+      qh[dt] = *(const qovec*)(qp + 16 * dt);
     } else {
 #pragma unroll
-      for (int e = 0; e < 8; ++e) qh[dt][e] = (_Float16)0.f;
+      for (int e = 0; e < 8; ++e) qh[dt][e] = (T)0.f;
     }
 #pragma unroll
     for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf((float)qh[dt][e]));
   }
   amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
   amax = fmaxf(amax, 1e-12f);
-  const float qinv = I8_MAX / amax;
-  const float c_q = sm_scale * LOG2E * (amax / I8_MAX);
+  const float qinv = P_SCALE / amax;
+  const float c_q = sm_scale * LOG2E * (amax / P_SCALE);
   i32x2 qf[8];
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
     float v[8];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) v[e] = clamp127(rintf((float)qh[dt][e] * qinv));
-    qf[dt] = (i32x2){pk4i(v[0], v[1], v[2], v[3]), pk4i(v[4], v[5], v[6], v[7])};
+    for (int e = 0; e < 8; ++e) v[e] = clamp448((float)qh[dt][e] * qinv);
+    qf[dt] = (i32x2){pk4(v[0], v[1], v[2], v[3]), pk4(v[4], v[5], v[6], v[7])};
   }
 
   // ---- staging ----
@@ -170,7 +153,6 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 
     // ---------------- phase 1: QK + scale + mask + ONE row max over 64 keys ----------------
     f32x8 sc[2][2];
-    i32x8 sci[2][2];
     bool skp[2];
     float lmax = -INFINITY;
 #pragma unroll
@@ -189,13 +171,13 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sci[st][kk][e] = 0;
+        for (int e = 0; e < 8; ++e) sc[st][kk][e] = 0.f;
 #pragma unroll
       for (int dt = 0; dt < 8; ++dt)
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk) {
           const i32x2 a = *(const i32x2*)(kb + (st * 32 + kk * 16) * KSTRIDE + dt * 16);
-          sci[st][kk] = wmma_i8(a, qf[dt], sci[st][kk]);
+          sc[st][kk] = wmma(a, qf[dt], sc[st][kk]);
         }
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
@@ -203,7 +185,7 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
         const f32x4 k1 = *(const f32x4*)(skb + st * 32 + kk * 16 + 4);
         const float skv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sc[st][kk][e] = (float)sci[st][kk][e] * (c_q * skv[e]);
+        for (int e = 0; e < 8; ++e) sc[st][kk][e] = sc[st][kk][e] * (c_q * skv[e]);
       }
       // The mask is ONE CTA-uniform branch around the whole 32-element select, so the
       // per-element predicate and the exec scaffolding it drives are skipped entirely whenever
@@ -294,23 +276,33 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const int row = q0 + 8 * lh + e;
-      if (row < N) O[(bh * N + row) * HD + d] = (_Float16)(acc[nt][e] * inv[e] + vm);
+      if (row < N) O[(bh * N + row) * HD + d] = (T)(acc[nt][e] * inv[e] + vm);
     }
   }
 }
 
-#define SK1T1_ARGS                                                                                \
-  const _Float16 *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,   \
+#define ATTN_ARGS(T)                                                                             \
+  const T *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,          \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
       const float *__restrict__ S, \
-      _Float16 *__restrict__ O, int H, int N, int N_pad, float sm_scale
+      T *__restrict__ O, int H, int N, int N_pad, float sm_scale
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t6i_attn_fwd_c0(SK1T1_ARGS) {
-  sk1t1_body<false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_f16_fwd(ATTN_ARGS(_Float16)) {
+  attn_body<false, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t6i_attn_fwd_c1(SK1T1_ARGS) {
-  sk1t1_body<true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_f16_fwd_causal(ATTN_ARGS(_Float16)) {
+  attn_body<true, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
+attn_fp8qk_bf16_fwd(ATTN_ARGS(__bf16)) {
+  attn_body<false, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+}
+
+extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
+attn_fp8qk_bf16_fwd_causal(ATTN_ARGS(__bf16)) {
+  attn_body<true, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }

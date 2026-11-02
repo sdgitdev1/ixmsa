@@ -111,17 +111,17 @@ from .quant import _fused as _quant_fused
 #: The bug that was fixed (found from a real Krea2 render, fp16, 8 steps, that went black from step
 #: 8): the earlier kernel folded the unnormalised softmax weight `p` into V's per-token scale as
 #: `p8 = e4m3(p * sv * 448)` with `sv = max(|V_row|,1)/448`, i.e. `p8 = e4m3(p * amax_v)`, with no
-#: clamp (see `kernels/hip/sk1_t4a1.hip`). Since `p` is the unnormalised weight
+#: clamp (the kernel before the `S` argument). Since `p` is the unnormalised weight
 #: `exp2((sc_ij - m_i)*log2e) <= 1`, the conversion overflows whenever
 #: `exp(sc_ij - m_i) * amax_v(key) > 464`; the output then goes non-finite for that whole query row.
 #: Every test the kernel had passed before used activations with `|V|` well under 448, so none of
 #: them could see it.
 #:
-#: The fix (`kernels/hip/sk1_t4a1s.hip`, the packaged object `sk1_t4a1s.gfx1201.hsaco`): a
+#: The fix (`kernels/hip/attn_fp8qk_f16.hip`, the packaged object `attn_fp8qk_f16.gfx1201.hsaco`): a
 #: per-`(b,h)` scalar `S = clamp_min(max_j sv(j), 1)` is computed on the device and passed as a 12th
 #: kernel argument; the prologue stages `SV' = SV/S` so the kernel's unchanged `sr = SV'*448` is
 #: `amax_v/S <= 448` for every key, and the epilogue carries the compensating `x S`. `S == 1.0`
-#: exactly whenever every `amax_v <= 448`, so the fix is bit-identical to `sk1_t4a1` there. An
+#: exactly whenever every `amax_v <= 448`, so the fix is bit-identical to the kernel without `S` there. An
 #: outlier sweep of 288 cells gave 0 non-finite outputs for the fixed kernel, where the old one
 #: produced 47 580 672 non-finite of 48 660 480 elements, and accuracy against fp64 stayed within
 #: 1.5x of the native path.
@@ -139,14 +139,14 @@ elif _sk1_env in ("0", "false", "no", "off"):
     SK1_BACKEND = False         # forced OFF
     SK1_BACKEND_STRICT = False
 else:
-    SK1_BACKEND = True          # DEFAULT: ON -- the p*amax_v overflow is fixed by sk1_t4a1s.
+    SK1_BACKEND = True          # DEFAULT: ON -- the p*amax_v overflow is fixed by attn_fp8qk_f16.
     SK1_BACKEND_STRICT = False  # ... with a silent fallback everywhere else.  =0 forces it OFF.
 
 #: INT8 Q.K objects, ON by default for fp16 with head_dim 128.
 #:
 #: Unset `SAGEATTN_SK1_INT8` routes the prebuilt SK1 path to the two int8 objects
-#: (`sageattention/sk1_backend/sk1_t6i.gfx1201.hsaco` for contiguous HND,
-#: `sk1_t6in.gfx1201.hsaco` for strided-HND/NHD) and to the int8 prologue, which quantises K per
+#: (`sageattention/sk1_backend/attn_int8qk_f16.gfx1201.hsaco` for contiguous HND,
+#: `attn_int8qk_f16_strided.gfx1201.hsaco` for strided-HND/NHD) and to the int8 prologue, which quantises K per
 #: token to int8 (`scale = max(max|k|,1)/127`, round-to-nearest-even, clamp [-128,127]) instead of
 #: e4m3. Q.K then runs on `v_wmma_i32_16x16x16_iu8` with int32 accumulators. The V / P.V path is the
 #: fp8 one, unchanged. On the accuracy and edge-length test cells the contiguous object was more
@@ -168,10 +168,10 @@ else:
     SK1_INT8 = True             # DEFAULT: ON -- int8 Q.K, with a NORMAL fallback
     SK1_INT8_STRICT = False     # ... so a call int8 cannot serve still gets served
 
-#: The BF16 Q/O objects. `SAGEATTN_SK1_BF16=1` routes a bf16 call to `sk1_t4a1sb.gfx1201.hsaco`
-#: (contiguous HND) or `sk1_t4a1nb.gfx1201.hsaco` (strided-HND/NHD), which are the same kernel
+#: The BF16 Q/O objects. `SAGEATTN_SK1_BF16=1` routes a bf16 call to `attn_fp8qk_bf16.gfx1201.hsaco`
+#: (contiguous HND) or `attn_fp8qk_bf16_strided.gfx1201.hsaco` (strided-HND/NHD), which are the same kernel
 #: source as the fp16 pair with the Q/O element type as a template parameter
-#: (`kernels/hip/sk1_t4a1sb.hip`). bf16 K/V go through the same fused Triton prologue kernels, because
+#: (`kernels/hip/attn_fp8qk_bf16.hip`). bf16 K/V go through the same fused Triton prologue kernels, because
 #: every load widens to fp32 exactly, so the fp8 bytes and the fp32 scales are the fp16 ones on the
 #: same values. `=1` is ON and strict; `=0` forces OFF.
 #:
@@ -1107,7 +1107,7 @@ def sageattn(
         old object folded ``p8 = e4m3(p * amax_v)`` with no clamp, so a key with
         ``|V| > 448`` carrying enough weight overflowed the fp8 conversion and the output went
         non-finite (a Krea2 render went black from step 8).  The packaged object is now
-        ``sk1_t4a1s``, which stages ``SV' = SV/S`` in the prologue and carries ``x S`` in the
+        ``attn_fp8qk_f16``, which stages ``SV' = SV/S`` in the prologue and carries ``x S`` in the
         epilogue; it is bit-identical to the old object whenever every ``amax_v <= 448``.
         Where it is used it serves the envelope
         ``tensor_layout`` of ``"HND"`` or ``"NHD"`` (contiguous, or a physically-NHD view), fp16, ``head_dim == 128``,
@@ -1161,8 +1161,8 @@ def sageattn(
             )
         fast_path_keys = {"value_dtype", "smooth_k", "qk_quant_gran", "pv_accum_dtype", "smooth_v"}
         # ------------------------------------------------------------------ prebuilt SK1
-        # ON by default, and the packaged object is `sk1_t4a1s` (the p*amax_v fp8 overflow of
-        # `sk1_t4a1` is repaired). `sk1_backend=None` reads the module constants: the unset-env
+        # ON by default, and the packaged object is `attn_fp8qk_f16` (the p*amax_v fp8 overflow of
+        # the kernel without `S` is repaired). `sk1_backend=None` reads the module constants: the unset-env
         # default is ON; `SAGEATTN_SK1_BACKEND=1` is ON-and-strict and `=0` is OFF. An explicit
         # `sk1_backend=True/False` forces ON(strict)/OFF.
         # The opt-in only ever tries the prebuilt kernel: `try_sk1_t1` returns (None, reason) for

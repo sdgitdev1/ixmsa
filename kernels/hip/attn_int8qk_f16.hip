@@ -1,18 +1,14 @@
-// SK1 T1: the KV loop restructured so there is ONE rescale per 64 keys.
+// attn_fp8qk_f16 with int8 Q.K.  Derived from attn_fp8qk_f16.hip by literal string substitution.
 //
-// Base: an earlier kernel with hoisted LDS base pointers and the x448 folded into the staged SV.
-// Structure change in the KV loop, for each 64-key tile j:
-//   phase 1: QK for BOTH 32-key sub-tiles, scale + mask, ONE row max over all 64 keys;
-//   phase 2: ONE m_use / ONE alpha = exp2(m_i - m_use), ONE l_i update, ONE acc *= alpha;
-//   phase 3: PV for both sub-tiles.
-// Mathematically identical to sk1 (sum exp2(x - m) is exact under a common shift); the ROUNDING
-// differs because the running max advances once per 64 keys instead of once per 32.
-//
-// An earlier attempt at this restructuring held all loads live and compiled to 256 VGPR with spills.  Here the K
-// fragments are transient inside the QK loops, the scale vectors die per 16-key tile, and the
-// `amdgpu_waves_per_eu(6,6)` attribute asks the register allocator for 6 waves/SIMD32 (<=240 VGPR).
-//
-// Same interface and numerics contract as sk1.hip; symbols sk1t1_attn_fwd_c0 / _c1.
+// Q and K are quantised per token to int8 (scale = amax/127, round to nearest even, clamp to
+// [-128,127]).  K is quantised by the prologue after smooth_k; Q is quantised in the kernel per
+// query row, the same way attn_fp8qk_f16 does it for e4m3.  Q.K runs on v_wmma_i32_16x16x16_iu8 with int32
+// accumulators, converted once to fp32 with the product of the two scales.  The operand fragment
+// layout is byte-identical to the fp8 path (checked against the int8 K and Q packing in PR #368's
+// qk_int_sv_gfx12_native.cu), so the LDS staging, the fragment loads and everything from the
+// softmax onward are unchanged.  The per-(b,h) `S` rescale and the three-phase KV loop are
+// described in attn_fp8qk_f16.hip.
+// Symbols attn_int8qk_f16_fwd / _fwd_causal.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -21,6 +17,7 @@ typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x8 __attribute__((ext_vector_type(8)));
+typedef int      i32x8 __attribute__((ext_vector_type(8)));
 typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
 
 #define BM 128
@@ -29,6 +26,7 @@ typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
 #define KSTRIDE 152
 #define VSTRIDE 72
 #define P_SCALE 448.0f
+#define I8_MAX 127.0f
 #define LOG2E 1.4426950408889634f
 
 __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
@@ -38,14 +36,41 @@ __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
 
 __device__ __forceinline__ float clamp448(float x) { return fminf(fmaxf(x, -P_SCALE), P_SCALE); }
 
+// int8 clamp.  The caller rounds to nearest even first, as PR #368's float_to_int8_nearby_gfx12 does.
+__device__ __forceinline__ float clamp127(float x) { return fminf(fmaxf(x, -128.0f), 127.0f); }
+
+// Pack 4 already-integral floats into 4 int8 in one VGPR.
+//   __builtin_rintf -> v_rndne_f32 (round to nearest even, the same tie rule as nearbyintf and
+//                      torch.round; v_cvt_pk_i16_f32 truncates, so the rounding must happen in
+//                      float first).
+//   (int)           -> v_cvt_i32_f32, truncation, which is exact on an already-integral float.
+// clang does not declare __builtin_amdgcn_cvt_pk_i16_f32 for gfx1201, and the bias and byte-select
+// semantics of cvt_pk_u8_f32 do not fit, so the bytes are assembled with plain ALU ops.  This runs
+// once per lane (16 groups) against a KV loop of ~778 instructions per tile, so it is off the hot
+// path.
+__device__ __forceinline__ int pk4i(float a, float b, float c, float d) {
+  const int ia = (int)__builtin_rintf(a);
+  const int ib = (int)__builtin_rintf(b);
+  const int ic = (int)__builtin_rintf(c);
+  const int id = (int)__builtin_rintf(d);
+  return (ia & 0xff) | ((ib & 0xff) << 8) | ((ic & 0xff) << 16) | ((id & 0xff) << 24);
+}
+
+// Signed int8 x signed int8 -> int32, no negation, signed accumulator.  The argument order is
+// (signA, A, signB, B, C, signAcc).
+__device__ __forceinline__ i32x8 wmma_i8(i32x2 a, i32x2 b, i32x8 c) {
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, true);
+}
+
 __device__ __forceinline__ f32x8 wmma(i32x2 a, i32x2 b, f32x8 c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
 }
 
 template <bool CAUSAL>
-__device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
+__device__ __forceinline__ void attn_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
                                            const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
                                            const float* __restrict__ SV, const float* __restrict__ VMEAN,
+                                           const float* __restrict__ S,
                                            _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale) {
   __shared__ __attribute__((aligned(16))) uint8_t sK[2][BN * KSTRIDE];
   __shared__ __attribute__((aligned(16))) uint8_t sV[2][HD * VSTRIDE];
@@ -55,6 +80,8 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lr = lane & 15, lh = lane >> 4;
   const int start_m = blockIdx.x;
   const size_t bh = (size_t)blockIdx.z * H + blockIdx.y;
+  // The per-(b,h) rescale the prologue applied to SV.  CTA-uniform, one load.
+  const float Sb = S[bh];
   const int q0 = start_m * BM + w * 16;
   const int qrow = q0 + lr;
   const int n_tiles = N_pad / BN;
@@ -78,15 +105,15 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   }
   amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
   amax = fmaxf(amax, 1e-12f);
-  const float qinv = P_SCALE / amax;
-  const float c_q = sm_scale * LOG2E * (amax / P_SCALE);
+  const float qinv = I8_MAX / amax;
+  const float c_q = sm_scale * LOG2E * (amax / I8_MAX);
   i32x2 qf[8];
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
     float v[8];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) v[e] = clamp448((float)qh[dt][e] * qinv);
-    qf[dt] = (i32x2){pk4(v[0], v[1], v[2], v[3]), pk4(v[4], v[5], v[6], v[7])};
+    for (int e = 0; e < 8; ++e) v[e] = clamp127(rintf((float)qh[dt][e] * qinv));
+    qf[dt] = (i32x2){pk4i(v[0], v[1], v[2], v[3]), pk4i(v[4], v[5], v[6], v[7])};
   }
 
   // ---- staging ----
@@ -143,6 +170,7 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 
     // ---------------- phase 1: QK + scale + mask + ONE row max over 64 keys ----------------
     f32x8 sc[2][2];
+    i32x8 sci[2][2];
     bool skp[2];
     float lmax = -INFINITY;
 #pragma unroll
@@ -161,13 +189,13 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sc[st][kk][e] = 0.f;
+        for (int e = 0; e < 8; ++e) sci[st][kk][e] = 0;
 #pragma unroll
       for (int dt = 0; dt < 8; ++dt)
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk) {
           const i32x2 a = *(const i32x2*)(kb + (st * 32 + kk * 16) * KSTRIDE + dt * 16);
-          sc[st][kk] = wmma(a, qf[dt], sc[st][kk]);
+          sci[st][kk] = wmma_i8(a, qf[dt], sci[st][kk]);
         }
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
@@ -175,16 +203,25 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
         const f32x4 k1 = *(const f32x4*)(skb + st * 32 + kk * 16 + 4);
         const float skv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
 #pragma unroll
-        for (int e = 0; e < 8; ++e) {
-          float x = sc[st][kk][e] * (c_q * skv[e]);
-          if (need_mask) {
-            const int key = base + kk * 16 + 8 * lh + e;
-            if (CAUSAL ? (key > qrow) : (key >= N)) x = -INFINITY;
-          }
-          sc[st][kk][e] = x;
-          lmax = fmaxf(lmax, x);
-        }
+        for (int e = 0; e < 8; ++e) sc[st][kk][e] = (float)sci[st][kk][e] * (c_q * skv[e]);
       }
+      // The mask is ONE CTA-uniform branch around the whole 32-element select, so the
+      // per-element predicate and the exec scaffolding it drives are skipped entirely whenever
+      // `need_mask` is false (137 of 138 iterations at N=8771 c0).  Bit-identical: the same
+      // products are formed and the same elements are set to -INFINITY, and `fmaxf` is exact.
+      if (need_mask) {
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk)
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int key = base + kk * 16 + 8 * lh + e;
+            if (CAUSAL ? (key > qrow) : (key >= N)) sc[st][kk][e] = -INFINITY;
+          }
+      }
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) lmax = fmaxf(lmax, sc[st][kk][e]);
     }
     lmax = fmaxf(lmax, __shfl_xor(lmax, 16, 32));
     const float m_new = fmaxf(m_i, lmax);
@@ -246,7 +283,9 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
 #pragma unroll
   for (int e = 0; e < 8; ++e) {
     const float l = __shfl(l_i, 8 * lh + e, 32);
-    inv[e] = l > 0.f ? 1.f / (l * P_SCALE) : 0.f;
+    // acc is (448/S) * sum(p*v) because the prologue staged SV' = SV/S, so the
+    // epilogue must carry S.  With Sb == 1.0f this is fl(1.0f/(l*448)) exactly.
+    inv[e] = l > 0.f ? Sb / (l * P_SCALE) : 0.f;
   }
 #pragma unroll
   for (int nt = 0; nt < 8; ++nt) {
@@ -260,17 +299,18 @@ __device__ __forceinline__ void sk1t1_body(const _Float16* __restrict__ Q, const
   }
 }
 
-#define SK1T1_ARGS                                                                                \
+#define ATTN_ARGS                                                                                \
   const _Float16 *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,   \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
+      const float *__restrict__ S, \
       _Float16 *__restrict__ O, int H, int N, int N_pad, float sm_scale
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t1_attn_fwd_c0(SK1T1_ARGS) {
-  sk1t1_body<false>(Q, K8, SK, V8T, SV, VMEAN, O, H, N, N_pad, sm_scale);
+attn_int8qk_f16_fwd(ATTN_ARGS) {
+  attn_body<false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t1_attn_fwd_c1(SK1T1_ARGS) {
-  sk1t1_body<true>(Q, K8, SK, V8T, SV, VMEAN, O, H, N, N_pad, sm_scale);
+attn_int8qk_f16_fwd_causal(ATTN_ARGS) {
+  attn_body<true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
 }

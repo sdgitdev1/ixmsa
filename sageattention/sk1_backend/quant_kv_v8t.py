@@ -9,7 +9,7 @@ compare against. So this module imports the shared primitives (`_cvt2d`, `SCALE_
 
 What the unfused path costs, and what this removes
 --------------------------------------------------
-`kernels/hip/sk1.hip` needs, per (b,h):
+the attention kernels in `kernels/hip/` need, per (b,h):
   K8   (N_pad, 128)  e4m3, rows >= N zero
   SK   (N_pad,)      fp32, rows >= N set to 1.0   (the `do_pad_kv` contract; the pad value is
                                                    irrelevant because K8 is 0 there)

@@ -47,11 +47,11 @@ python setup.py --no-build-ext bdist_wheel
 
 ```
 python tools/build_hsaco.py                 # rebuild all shipped gfx1201 objects in place
-python tools/build_hsaco.py --arch gfx1200  # the RX 9060 XT builds (*_1200.hsaco)
+python tools/build_hsaco.py --arch gfx1200  # the RX 9060 XT builds (*.gfx1200.hsaco)
 python tools/build_hsaco.py --check         # build to a temp dir and compare with the shipped files
 ```
 
-The shipped objects are the attention kernels and the K/V prologue (`kernels/hip/h34_prologue.hip`),
+The shipped objects are the attention kernels and the K/V prologue (`kernels/hip/kv_prologue.hip`),
 which quantizes K and V before every call. The script compiles each one device-only for the target
 and unbundles the raw ELF that
 `hipModuleLoadData` expects. It needs no GPU. It finds clang from, in order: `SK1_CLANG`,
@@ -60,6 +60,40 @@ and unbundles the raw ELF that
 `--check` compares the machine code, kernel descriptors and resource metadata, and ignores symbol
 tables. A comment change renames an internal symbol, so the files are not byte-identical after any
 source edit.
+
+Each object is `<name>.gfx1201.hsaco` or `<name>.gfx1200.hsaco`, built from `kernels/hip/<name>.hip`:
+
+| object | Q/O | Q.K | layout |
+|---|---|---|---|
+| `attn_fp8qk_f16` | fp16 | fp8 | contiguous HND, takes the V scale `S` |
+| `attn_fp8qk_f16_strided` | fp16 | fp8 | strided HND and NHD |
+| `attn_fp8qk_bf16` | bf16 | fp8 | contiguous HND |
+| `attn_fp8qk_bf16_strided` | bf16 | fp8 | strided HND and NHD |
+| `attn_int8qk_f16` | fp16 | int8 | contiguous HND |
+| `attn_int8qk_f16_strided` | fp16 | int8 | strided HND and NHD |
+| `kv_prologue` | fp16, bf16 | | K/V quantization before every call |
+
+### Kernel names before v0.5
+
+[FINDINGS.md](FINDINGS.md), [JOURNEY.md](JOURNEY.md) and the changelog use the old names.
+
+| before v0.5 | now |
+|---|---|
+| `sk1_t4a1s` | `attn_fp8qk_f16` |
+| `sk1_t4a1n` | `attn_fp8qk_f16_strided` |
+| `sk1_t4a1sb` | `attn_fp8qk_bf16` |
+| `sk1_t4a1nb` | `attn_fp8qk_bf16_strided` |
+| `sk1_t6i` | `attn_int8qk_f16` |
+| `sk1_t6in` | `attn_int8qk_f16_strided` |
+| `h34_prologue` | `kv_prologue` |
+| `sk1_t4a1` (the kernel before the `S` fix) | removed |
+| `sk1_d64` (head_dim 64, never routed) | removed |
+| `sk1`, `sk1_t1`, `sk1_layout_probe` (research sources) | removed |
+| `<name>_1200.hsaco` | `<name>.gfx1200.hsaco` |
+
+Entry points are `<name>_fwd` and `<name>_fwd_causal` (before: `<tag>_attn_fwd_c0` and `_c1`). The
+prologue entry points lost their `h34_` prefix (`quant_kv_f16_i8`, `kseq_mean_bf16`, ...). Machine
+code is unchanged: the `.text` of every object is byte-identical to the previous object.
 
 Any change to a kernel has to pass the gates in [METHOD.md](METHOD.md) §3 before it is timed. Those
 are: at most 240 VGPRs, no spills, LDS within budget, and no barrier reachable by only some waves.

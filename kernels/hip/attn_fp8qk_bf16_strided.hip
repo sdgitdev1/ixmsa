@@ -1,17 +1,11 @@
-// SK1 T4a1sb: T4a1s with the Q/O element type as a template parameter, so the same kernel source
-// serves fp16 and bf16.  Derived from sk1_t4a1s.hip by literal string substitution.
+// attn_fp8qk_bf16 plus generalised Q/O addressing (explicit row, head and batch element
+// strides).  Derived from attn_fp8qk_bf16.hip by literal string substitution, with the same edits that
+// give attn_fp8qk_f16_strided.hip its strides.
 //
-// bf16 and fp16 are both 16 bits wide, so the Q vector load, every address and the whole KV loop
-// are unchanged.  The only two dtype-dependent operations are the Q widen `(float)qh[..]` and the O
-// narrow `(T)(acc*inv + vm)`; K, V and P are e4m3 and every scale is fp32, so the quantisation
-// arithmetic is the same text for both.  clang emits the same `global_load_b128` for a bf16 vector
-// load as for fp16, widens bf16 to fp32 by bit placement (no `v_cvt`), and narrows fp32 to bf16
-// with a 5-VALU round-to-nearest-even sequence plus `global_store_d16_hi_b16`.
-//
-// Four entry points: `sk1t4a1sp_attn_fwd_c0/_c1` are the `_Float16` instantiation, kept so its code
-// can be compared against a build of the unmodified sk1_t4a1s.hip, and
-// `sk1t4a1sb_attn_fwd_c0/_c1` are `__bf16`.  The per-(b,h) `S` rescale and the three-phase KV loop
-// are described in sk1_t4a1s.hip.
+// With (q_rstride, q_hstride, q_bstride) = (HD, N*HD, H*N*HD) the Q address is identical to
+// attn_fp8qk_bf16's, and with the matching O strides the store is too, so a strided-HND or NHD call is
+// bit-identical to the contiguous kernel on the same data.  Four entry points again:
+// `attn_fp8qk_f16_strided_fwd/_fwd_causal` (`_Float16`) and `attn_fp8qk_bf16_strided_fwd/_fwd_causal` (`__bf16`).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -49,11 +43,13 @@ __device__ __forceinline__ f32x8 wmma(i32x2 a, i32x2 b, f32x8 c) {
 }
 
 template <bool CAUSAL, typename T>
-__device__ __forceinline__ void sk1t1_body(const T* __restrict__ Q, const uint8_t* __restrict__ K8,
+__device__ __forceinline__ void attn_body(const T* __restrict__ Q, const uint8_t* __restrict__ K8,
                                            const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
                                            const float* __restrict__ SV, const float* __restrict__ VMEAN,
                                            const float* __restrict__ S,
-                                           T* __restrict__ O, int H, int N, int N_pad, float sm_scale) {
+                                           T* __restrict__ O, int H, int N, int N_pad, float sm_scale,
+                                           int q_rstride, int q_hstride, int q_bstride,
+                                           int o_rstride, int o_hstride, int o_bstride) {
   __shared__ __attribute__((aligned(16))) uint8_t sK[2][BN * KSTRIDE];
   __shared__ __attribute__((aligned(16))) uint8_t sV[2][HD * VSTRIDE];
   __shared__ __attribute__((aligned(16))) float sS[2][BN];
@@ -62,6 +58,13 @@ __device__ __forceinline__ void sk1t1_body(const T* __restrict__ Q, const uint8_
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, lr = lane & 15, lh = lane >> 4;
   const int start_m = blockIdx.x;
   const size_t bh = (size_t)blockIdx.z * H + blockIdx.y;
+  // Generalised (b,h) addressing for Q and O.  For a contiguous HND (B,H,N,D) tensor
+  // (rs,hs,bs) = (HD, N*HD, H*N*HD) and both addresses below reduce exactly to the attn_fp8qk_bf16
+  // form.
+  const size_t qbase = (size_t)blockIdx.z * (size_t)q_bstride
+                     + (size_t)blockIdx.y * (size_t)q_hstride;
+  const size_t obase = (size_t)blockIdx.z * (size_t)o_bstride
+                     + (size_t)blockIdx.y * (size_t)o_hstride;
   // The per-(b,h) rescale the prologue applied to SV.  CTA-uniform, one load.
   const float Sb = S[bh];
   const int q0 = start_m * BM + w * 16;
@@ -74,7 +77,7 @@ __device__ __forceinline__ void sk1t1_body(const T* __restrict__ Q, const uint8_
   typedef typename QOVec<T>::type qovec;
   qovec qh[8];
   float amax = 0.f;
-  const T* qp = Q + (bh * N + qrow) * HD + 8 * lh;
+  const T* qp = Q + qbase + (size_t)qrow * (size_t)q_rstride + 8 * lh;
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
     if (qrow < N) {
@@ -276,33 +279,40 @@ __device__ __forceinline__ void sk1t1_body(const T* __restrict__ Q, const uint8_
 #pragma unroll
     for (int e = 0; e < 8; ++e) {
       const int row = q0 + 8 * lh + e;
-      if (row < N) O[(bh * N + row) * HD + d] = (T)(acc[nt][e] * inv[e] + vm);
+      if (row < N) O[obase + (size_t)row * (size_t)o_rstride + d]
+          = (T)(acc[nt][e] * inv[e] + vm);
     }
   }
 }
 
-#define SK1T1_ARGS(T)                                                                             \
+#define ATTN_ARGS(T)                                                                             \
   const T *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,          \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
       const float *__restrict__ S, \
-      T *__restrict__ O, int H, int N, int N_pad, float sm_scale
+      T *__restrict__ O, int H, int N, int N_pad, float sm_scale, \
+      int q_rstride, int q_hstride, int q_bstride, \
+      int o_rstride, int o_hstride, int o_bstride
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1sp_attn_fwd_c0(SK1T1_ARGS(_Float16)) {
-  sk1t1_body<false, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_f16_strided_fwd(ATTN_ARGS(_Float16)) {
+  attn_body<false, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1sp_attn_fwd_c1(SK1T1_ARGS(_Float16)) {
-  sk1t1_body<true, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_f16_strided_fwd_causal(ATTN_ARGS(_Float16)) {
+  attn_body<true, _Float16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1sb_attn_fwd_c0(SK1T1_ARGS(__bf16)) {
-  sk1t1_body<false, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_bf16_strided_fwd(ATTN_ARGS(__bf16)) {
+  attn_body<false, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1t4a1sb_attn_fwd_c1(SK1T1_ARGS(__bf16)) {
-  sk1t1_body<true, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale);
+attn_fp8qk_bf16_strided_fwd_causal(ATTN_ARGS(__bf16)) {
+  attn_body<true, __bf16>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }

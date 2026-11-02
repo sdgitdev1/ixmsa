@@ -137,7 +137,7 @@ def main():
         rep["gfx1200_status"] = None
     rep["resolved_object_names"] = {
         n: getattr(SB, n, None) for n in
-        ("SK1_HSACO_NAME", "SK1_HSACO_NAME_S", "SK1_HSACO_NAME_N", "SK1_HSACO_NAME_I8",
+        ("SK1_HSACO_NAME_S", "SK1_HSACO_NAME_N", "SK1_HSACO_NAME_I8",
          "SK1_HSACO_NAME_I8N", "SK1_HSACO_NAME_B", "SK1_HSACO_NAME_BN")}
 
     say("-" * 78)
@@ -186,7 +186,7 @@ def main():
         say("vs fallback      ", "max |diff| = %.6g" % rep["served"]["max_abs_diff_vs_fallback"])
         if not served:
             say("  !! no code object was loaded: the call did NOT use the prebuilt kernels")
-        elif all(n.endswith("_1200.hsaco") for n in served.values()) and rep["device_arch"] == "gfx1200":
+        elif all(n.endswith(".gfx1200.hsaco") for n in served.values()) and rep["device_arch"] == "gfx1200":
             say("  OK: the gfx1200 objects served this call")
         elif all(n.endswith(".gfx1201.hsaco") for n in served.values()):
             say("  OK: the gfx1201 objects served this call")

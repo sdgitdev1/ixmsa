@@ -22,8 +22,8 @@
 // is discarded by the caller.
 //
 // Symbols (all `extern "C"`):
-//   h34_quant_kv_f16_i8 / h34_quant_kv_f16_f8 / h34_quant_kv_bf16_f8
-//   h34_kseq_mean_f16 / h34_kseq_mean_bf16
+//   quant_kv_f16_i8 / quant_kv_f16_f8 / quant_kv_bf16_f8
+//   kseq_mean_f16 / kseq_mean_bf16
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -212,7 +212,7 @@ __device__ __forceinline__ void quant_kv_body(
 }
 
 extern "C" __global__ void __launch_bounds__(NT)
-h34_quant_kv_f16_i8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, float* SV,
+quant_kv_f16_i8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, float* SV,
                     const float* MEAN, long long N, long long N_pad, long long H,
                     long long k_sb, long long k_sh, long long k_sr,
                     long long v_sb, long long v_sh, long long v_sr,
@@ -222,7 +222,7 @@ h34_quant_kv_f16_i8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, floa
 }
 
 extern "C" __global__ void __launch_bounds__(NT)
-h34_quant_kv_f16_f8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, float* SV,
+quant_kv_f16_f8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, float* SV,
                     const float* MEAN, long long N, long long N_pad, long long H,
                     long long k_sb, long long k_sh, long long k_sr,
                     long long v_sb, long long v_sh, long long v_sr,
@@ -232,7 +232,7 @@ h34_quant_kv_f16_f8(const f16* K, const f16* V, u8* K8, float* SK, u8* V8T, floa
 }
 
 extern "C" __global__ void __launch_bounds__(NT)
-h34_quant_kv_bf16_f8(const __bf16* K, const __bf16* V, u8* K8, float* SK, u8* V8T, float* SV,
+quant_kv_bf16_f8(const __bf16* K, const __bf16* V, u8* K8, float* SK, u8* V8T, float* SV,
                      const float* MEAN, long long N, long long N_pad, long long H,
                      long long k_sb, long long k_sh, long long k_sr,
                      long long v_sb, long long v_sh, long long v_sr,
@@ -282,13 +282,13 @@ __device__ __forceinline__ void kseq_mean_body(const T* __restrict__ K, float* _
 }
 
 extern "C" __global__ void __launch_bounds__(256)
-h34_kseq_mean_f16(const f16* K, float* MEAN, long long N, long long H,
+kseq_mean_f16(const f16* K, float* MEAN, long long N, long long H,
                   long long k_sb, long long k_sh, long long k_sr) {
   kseq_mean_body<f16>(K, MEAN, N, H, k_sb, k_sh, k_sr);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
-h34_kseq_mean_bf16(const __bf16* K, float* MEAN, long long N, long long H,
+kseq_mean_bf16(const __bf16* K, float* MEAN, long long N, long long H,
                    long long k_sb, long long k_sh, long long k_sr) {
   kseq_mean_body<__bf16>(K, MEAN, N, H, k_sb, k_sh, k_sr);
 }

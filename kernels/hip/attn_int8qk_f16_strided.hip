@@ -1,39 +1,14 @@
-// SK1 D64: the SK1 hand kernel for HEAD_DIM == 64.
+// attn_int8qk_f16 plus generalised Q/O addressing (explicit row, head and batch element strides).
+// Derived from attn_int8qk_f16.hip by literal string substitution.
 //
-// Derived by hand from sk1_t4a1n.hip, the variant that carries the `p*amax_v` overflow fix
-// (`S`/`SV'`) and the generalised (row, head, batch) Q/O strides that make strided-HND and NHD
-// calls work.  The changes are exactly:
-//
-//   1. `#define HD 128` -> `HD 64`, and `#define KSTRIDE 152` -> `72`.  K's LDS row is now
-//      64 data bytes; 72 = 64 + 8 keeps the 16-lane 8-byte A-operand read conflict-free
-//      (72*lr mod 128 takes 16 distinct values for lr = 0..15: gcd(72,128) = 8, order 16).
-//      `VSTRIDE` stays 72 -- the V tile's row is the KEY axis (BN = 64 keys), which does not
-//      change with HD, so V's staging, stride and bank pattern are identical.
-//   2. `NDT = HD/16 = 4`: the Q fragments (`qh`/`qf`), the output tiles (`acc`) and the PV
-//      unroll are 4 per wave instead of 8.  The QK score fragments (`sc`/`pa`) are 2x2 per
-//      iteration in both kernels -- they are sized by BN, not by HD -- so the softmax, the
-//      mask, the P fold and the rescale are untouched.
-//   3. The staging is re-indexed for a 64-byte row: 4 threads per row at 16 bytes each
-//      (256 threads x 16 B = 4096 B = the whole K tile, and the same for V) instead of
-//      4 threads per row at 32 bytes on a 128-byte row.
-//   4. The body is a template over `BM_T` (query rows per CTA) and `WARPS`, so the same
-//      numerics core is instantiated for a 128-row CTA (8 warps) and a 256-row CTA
-//      (16 warps).  `BM_T/BN` replaces the literal `2` in the causal `full`/`j_hi` bounds.
-//   5. Three entry-point pairs:
-//        sk1d64_*   BM=128, 8 warps,  waves_per_eu(6,6)   -- the direct D=64 analogue
-//        sk1d64w_*  BM=128, 8 warps,  waves_per_eu(8,8)   -- the 8-waves/SIMD variant
-//        sk1d64m_*  BM=256, 16 warps, waves_per_eu(8,8)   -- the larger-query-tile variant
-//      `BM_T == WARPS*16` in every case (each warp owns 16 query rows, unchanged).
-//
-// Everything else is unchanged: the per-token Q quantisation and its `shfl_xor 16` amax, the
-// exp2-domain scores, the one-rescale-per-64-keys schedule, the row-sum-before-the-`sv*448`-fold
-// order, `cvt_pk_fp8_f32` packing, the CTA-uniform `need_mask` branch, the `S`/`SV'` fold and its
-// epilogue `x S`, and the `acc/(l*448) + vmean` epilogue.
-//
-// Contract (identical to sk1_t4a1n): Q (B*H, N, HD) fp16 raw; K8 (B*H, N_pad, HD) e4m3 padded;
-// SK (B*H, N_pad) fp32; V8T (B*H, HD, N_pad) e4m3 (V TRANSPOSED); SV (B*H, N_pad) fp32;
-// VMEAN (B*H, HD) fp32 or NULL; S (B*H,) fp32; O (B*H, N, HD) fp16; then H, N, N_pad, sm_scale
-// and the six Q/O strides.  N_pad is a multiple of 64.
+// attn_int8qk_f16 inherits the contiguous `(B*H, N, HD)` Q/O addressing of attn_fp8qk_f16, so it cannot be used
+// on a non-contiguous HND view or on NHD `(B, N, H, D)` input.  This kernel takes the (row, head,
+// batch) element strides as six integers, so the plane base is `blockIdx.z*bs + blockIdx.y*hs`
+// instead of `bh*N*HD`.  With (rs, hs, bs) = (HD, N*HD, H*N*HD) the address is identical to
+// attn_int8qk_f16's, and the int8 K fragment load, the iu8 QK phase, the softmax, the fp8 P.V path, the
+// folds and the `S` rescale are byte-identical, so a strided or NHD call gives the same result as
+// attn_int8qk_f16 on the same data made contiguous HND.
+// Symbols attn_int8qk_f16_strided_fwd / _fwd_causal.
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -42,14 +17,16 @@ typedef unsigned u32x2 __attribute__((ext_vector_type(2)));
 typedef unsigned u32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x4 __attribute__((ext_vector_type(4)));
 typedef float    f32x8 __attribute__((ext_vector_type(8)));
+typedef int      i32x8 __attribute__((ext_vector_type(8)));
 typedef _Float16 f16x8 __attribute__((ext_vector_type(8)));
 
+#define BM 128
 #define BN 64
-#define HD 64
-#define NDT 4          // HD/16: Q fragments, output tiles and the PV unroll per wave
-#define KSTRIDE 72     // 64 data bytes + 8 pad; 72*lr mod 128 is 16 distinct slots for lr<16
-#define VSTRIDE 72     // unchanged from sk1_t4a1n: the V row is the KEY axis (BN = 64 keys)
+#define HD 128
+#define KSTRIDE 152
+#define VSTRIDE 72
 #define P_SCALE 448.0f
+#define I8_MAX 127.0f
 #define LOG2E 1.4426950408889634f
 
 __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
@@ -59,20 +36,44 @@ __device__ __forceinline__ int pk4(float a, float b, float c, float d) {
 
 __device__ __forceinline__ float clamp448(float x) { return fminf(fmaxf(x, -P_SCALE), P_SCALE); }
 
+// int8 clamp.  The caller rounds to nearest even first, as PR #368's float_to_int8_nearby_gfx12 does.
+__device__ __forceinline__ float clamp127(float x) { return fminf(fmaxf(x, -128.0f), 127.0f); }
+
+// Pack 4 already-integral floats into 4 int8 in one VGPR.
+//   __builtin_rintf -> v_rndne_f32 (round to nearest even, the same tie rule as nearbyintf and
+//                      torch.round; v_cvt_pk_i16_f32 truncates, so the rounding must happen in
+//                      float first).
+//   (int)           -> v_cvt_i32_f32, truncation, which is exact on an already-integral float.
+// clang does not declare __builtin_amdgcn_cvt_pk_i16_f32 for gfx1201, and the bias and byte-select
+// semantics of cvt_pk_u8_f32 do not fit, so the bytes are assembled with plain ALU ops.  This runs
+// once per lane (16 groups) against a KV loop of ~778 instructions per tile, so it is off the hot
+// path.
+__device__ __forceinline__ int pk4i(float a, float b, float c, float d) {
+  const int ia = (int)__builtin_rintf(a);
+  const int ib = (int)__builtin_rintf(b);
+  const int ic = (int)__builtin_rintf(c);
+  const int id = (int)__builtin_rintf(d);
+  return (ia & 0xff) | ((ib & 0xff) << 8) | ((ic & 0xff) << 16) | ((id & 0xff) << 24);
+}
+
+// Signed int8 x signed int8 -> int32, no negation, signed accumulator.  The argument order is
+// (signA, A, signB, B, C, signAcc).
+__device__ __forceinline__ i32x8 wmma_i8(i32x2 a, i32x2 b, i32x8 c) {
+  return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, true);
+}
+
 __device__ __forceinline__ f32x8 wmma(i32x2 a, i32x2 b, f32x8 c) {
   return __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(a, b, c);
 }
 
-template <int BM_T, int WARPS, bool CAUSAL>
-__device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
-                                            const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
-                                            const float* __restrict__ SV, const float* __restrict__ VMEAN,
-                                            const float* __restrict__ S,
-                                            _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale,
-                                            int q_rstride, int q_hstride, int q_bstride,
-                                            int o_rstride, int o_hstride, int o_bstride) {
-  static_assert(BM_T == WARPS * 16, "one warp owns 16 query rows");
-  static_assert(BM_T % BN == 0, "the causal tile bounds need BM_T/BN to be exact");
+template <bool CAUSAL>
+__device__ __forceinline__ void attn_body(const _Float16* __restrict__ Q, const uint8_t* __restrict__ K8,
+                                           const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
+                                           const float* __restrict__ SV, const float* __restrict__ VMEAN,
+                                           const float* __restrict__ S,
+                                           _Float16* __restrict__ O, int H, int N, int N_pad, float sm_scale,
+                                           int q_rstride, int q_hstride, int q_bstride,
+                                           int o_rstride, int o_hstride, int o_bstride) {
   __shared__ __attribute__((aligned(16))) uint8_t sK[2][BN * KSTRIDE];
   __shared__ __attribute__((aligned(16))) uint8_t sV[2][HD * VSTRIDE];
   __shared__ __attribute__((aligned(16))) float sS[2][BN];
@@ -84,26 +85,26 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
   // Generalised (b,h) addressing for Q and O.  `q_rstride` is the element stride between
   // consecutive query rows, `q_hstride` between consecutive heads and `q_bstride` between
   // consecutive batches, so the plane base is not `bh*N*HD` in general.  For a contiguous HND
-  // (B,H,N,D) tensor (rs,hs,bs) = (HD, N*HD, H*N*HD) and both addresses reduce exactly to the
-  // sk1_t4a1s form.
+  // (B,H,N,D) tensor (rs,hs,bs) = (HD, N*HD, H*N*HD) and both addresses below reduce exactly to
+  // the attn_int8qk_f16 form.
   const size_t qbase = (size_t)blockIdx.z * (size_t)q_bstride
                      + (size_t)blockIdx.y * (size_t)q_hstride;
   const size_t obase = (size_t)blockIdx.z * (size_t)o_bstride
                      + (size_t)blockIdx.y * (size_t)o_hstride;
   // The per-(b,h) rescale the prologue applied to SV.  CTA-uniform, one load.
   const float Sb = S[bh];
-  const int q0 = start_m * BM_T + w * 16;
+  const int q0 = start_m * BM + w * 16;
   const int qrow = q0 + lr;
   const int n_tiles = N_pad / BN;
-  const int j_hi = CAUSAL ? min(n_tiles, (BM_T / BN) * (start_m + 1)) : n_tiles;
-  const int full = CAUSAL ? (BM_T / BN) * start_m : n_tiles;
+  const int j_hi = CAUSAL ? min(n_tiles, 2 * start_m + 2) : n_tiles;
+  const int full = CAUSAL ? 2 * start_m : n_tiles;
 
-  // ---- Q: raw fp16 -> e4m3, per-token scale, 8 B fragments (NDT of them at HD=64) ----
-  f16x8 qh[NDT];
+  // ---- Q: raw fp16 -> e4m3, per-token scale, 8 B fragments ----
+  f16x8 qh[8];
   float amax = 0.f;
   const _Float16* qp = Q + qbase + (size_t)qrow * (size_t)q_rstride + 8 * lh;
 #pragma unroll
-  for (int dt = 0; dt < NDT; ++dt) {
+  for (int dt = 0; dt < 8; ++dt) {
     if (qrow < N) {
       qh[dt] = *(const f16x8*)(qp + 16 * dt);
     } else {
@@ -115,54 +116,52 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
   }
   amax = fmaxf(amax, __shfl_xor(amax, 16, 32));
   amax = fmaxf(amax, 1e-12f);
-  const float qinv = P_SCALE / amax;
-  const float c_q = sm_scale * LOG2E * (amax / P_SCALE);
-  i32x2 qf[NDT];
+  const float qinv = I8_MAX / amax;
+  const float c_q = sm_scale * LOG2E * (amax / I8_MAX);
+  i32x2 qf[8];
 #pragma unroll
-  for (int dt = 0; dt < NDT; ++dt) {
+  for (int dt = 0; dt < 8; ++dt) {
     float v[8];
 #pragma unroll
-    for (int e = 0; e < 8; ++e) v[e] = clamp448((float)qh[dt][e] * qinv);
-    qf[dt] = (i32x2){pk4(v[0], v[1], v[2], v[3]), pk4(v[4], v[5], v[6], v[7])};
+    for (int e = 0; e < 8; ++e) v[e] = clamp127(rintf((float)qh[dt][e] * qinv));
+    qf[dt] = (i32x2){pk4i(v[0], v[1], v[2], v[3]), pk4i(v[4], v[5], v[6], v[7])};
   }
 
   // ---- staging ----
-  // 256 threads x 16 B = 4096 B = the whole K tile (64 rows x 64 B) and the whole V tile
-  // (64 head-dim rows x 64 keys).  Four threads per row at 16-byte granularity, so every
-  // (row, 16 B) start is 16-byte aligned and the row's 64 data bytes are covered exactly.
-  // A 512-thread CTA stages with its first 256 threads (the tile is the same size).
-  u32x4 kr0, vr0;
+  u32x4 kr0, kr1, vr0, vr1;
   f32x4 sr = {0.f, 0.f, 0.f, 0.f};
   auto gload = [&](int j) {
-    if (tid < 256) {
-      const int row = tid >> 2, col = (tid & 3) * 16;
-      kr0 = *(const u32x4*)(K8 + (bh * N_pad + (size_t)j * BN + row) * HD + col);
-      vr0 = *(const u32x4*)(V8T + (bh * HD + row) * N_pad + (size_t)j * BN + col);
-    }
+    const uint8_t* kp = K8 + (bh * N_pad + (size_t)j * BN + (tid >> 2)) * HD + (tid & 3) * 32;
+    kr0 = *(const u32x4*)kp;
+    kr1 = *(const u32x4*)(kp + 16);
+    const uint8_t* vp = V8T + (bh * HD + (tid >> 1)) * N_pad + (size_t)j * BN + (tid & 1) * 32;
+    vr0 = *(const u32x4*)vp;
+    vr1 = *(const u32x4*)(vp + 16);
     if (tid < 16)
       sr = *(const f32x4*)(SK + bh * N_pad + (size_t)j * BN + 4 * tid);
     else if (tid < 32)
       sr = *(const f32x4*)(SV + bh * N_pad + (size_t)j * BN + 4 * (tid - 16)) * P_SCALE;
   };
   auto lstore = [&](int s) {
-    if (tid < 256) {
-      const int row = tid >> 2, col = (tid & 3) * 16;
-      uint8_t* kd = &sK[s][row * KSTRIDE + col];
-      *(u32x2*)(kd + 0) = kr0.xy;
-      *(u32x2*)(kd + 8) = kr0.zw;
-      uint8_t* vd = &sV[s][row * VSTRIDE + col];
-      *(u32x2*)(vd + 0) = vr0.xy;
-      *(u32x2*)(vd + 8) = vr0.zw;
-    }
+    uint8_t* kd = &sK[s][(tid >> 2) * KSTRIDE + (tid & 3) * 32];
+    *(u32x2*)(kd + 0) = kr0.xy;
+    *(u32x2*)(kd + 8) = kr0.zw;
+    *(u32x2*)(kd + 16) = kr1.xy;
+    *(u32x2*)(kd + 24) = kr1.zw;
+    uint8_t* vd = &sV[s][(tid >> 1) * VSTRIDE + (tid & 1) * 32];
+    *(u32x2*)(vd + 0) = vr0.xy;
+    *(u32x2*)(vd + 8) = vr0.zw;
+    *(u32x2*)(vd + 16) = vr1.xy;
+    *(u32x2*)(vd + 24) = vr1.zw;
     if (tid < 16)
       *(f32x4*)&sS[s][4 * tid] = sr;
     else if (tid < 32)
       *(f32x4*)&sSV[s][4 * (tid - 16)] = sr;
   };
 
-  f32x8 acc[NDT];
+  f32x8 acc[8];
 #pragma unroll
-  for (int nt = 0; nt < NDT; ++nt)
+  for (int nt = 0; nt < 8; ++nt)
 #pragma unroll
     for (int e = 0; e < 8; ++e) acc[nt][e] = 0.f;
   float m_i = -INFINITY, l_i = 0.f;
@@ -182,6 +181,7 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
 
     // ---------------- phase 1: QK + scale + mask + ONE row max over 64 keys ----------------
     f32x8 sc[2][2];
+    i32x8 sci[2][2];
     bool skp[2];
     float lmax = -INFINITY;
 #pragma unroll
@@ -200,13 +200,13 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sc[st][kk][e] = 0.f;
+        for (int e = 0; e < 8; ++e) sci[st][kk][e] = 0;
 #pragma unroll
-      for (int dt = 0; dt < NDT; ++dt)
+      for (int dt = 0; dt < 8; ++dt)
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk) {
           const i32x2 a = *(const i32x2*)(kb + (st * 32 + kk * 16) * KSTRIDE + dt * 16);
-          sc[st][kk] = wmma(a, qf[dt], sc[st][kk]);
+          sci[st][kk] = wmma_i8(a, qf[dt], sci[st][kk]);
         }
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
@@ -214,12 +214,12 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
         const f32x4 k1 = *(const f32x4*)(skb + st * 32 + kk * 16 + 4);
         const float skv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sc[st][kk][e] = sc[st][kk][e] * (c_q * skv[e]);
+        for (int e = 0; e < 8; ++e) sc[st][kk][e] = (float)sci[st][kk][e] * (c_q * skv[e]);
       }
       // The mask is ONE CTA-uniform branch around the whole 32-element select, so the
       // per-element predicate and the exec scaffolding it drives are skipped entirely whenever
-      // `need_mask` is false.  Bit-identical: the same products are formed and the same elements
-      // are set to -INFINITY, and `fmaxf` is exact.
+      // `need_mask` is false (137 of 138 iterations at N=8771 c0).  Bit-identical: the same
+      // products are formed and the same elements are set to -INFINITY, and `fmaxf` is exact.
       if (need_mask) {
 #pragma unroll
         for (int kk = 0; kk < 2; ++kk)
@@ -268,7 +268,7 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
 #pragma unroll
     for (int e = 0; e < 8; ++e) ar[e] = __shfl(alpha, 8 * lh + e, 32);
 #pragma unroll
-    for (int nt = 0; nt < NDT; ++nt)
+    for (int nt = 0; nt < 8; ++nt)
 #pragma unroll
       for (int e = 0; e < 8; ++e) acc[nt][e] *= ar[e];
 
@@ -279,7 +279,7 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-        for (int nt = 0; nt < NDT; ++nt) {
+        for (int nt = 0; nt < 8; ++nt) {
           const i32x2 b = *(const i32x2*)(vb + nt * 16 * VSTRIDE + st * 32 + kk * 16);
           acc[nt] = wmma(pa[st][kk], b, acc[nt]);
         }
@@ -299,7 +299,7 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
     inv[e] = l > 0.f ? Sb / (l * P_SCALE) : 0.f;
   }
 #pragma unroll
-  for (int nt = 0; nt < NDT; ++nt) {
+  for (int nt = 0; nt < 8; ++nt) {
     const int d = nt * 16 + lr;
     const float vm = VMEAN ? VMEAN[bh * HD + d] : 0.f;
 #pragma unroll
@@ -311,7 +311,7 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
   }
 }
 
-#define SK1D64_ARGS                                                                               \
+#define ATTN_ARGS                                                                                \
   const _Float16 *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,   \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
       const float *__restrict__ S, \
@@ -319,41 +319,14 @@ __device__ __forceinline__ void sk1d64_body(const _Float16* __restrict__ Q, cons
       int q_rstride, int q_hstride, int q_bstride, \
       int o_rstride, int o_hstride, int o_bstride
 
-// ---- BM=128, 8 warps, waves_per_eu(6,6) -- the direct D=64 analogue ----
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1d64_attn_fwd_c0(SK1D64_ARGS) {
-  sk1d64_body<128, 8, false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                             q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
+attn_int8qk_f16_strided_fwd(ATTN_ARGS) {
+  attn_body<false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(6, 6)))
-sk1d64_attn_fwd_c1(SK1D64_ARGS) {
-  sk1d64_body<128, 8, true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                            q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
-}
-
-// ---- BM=128, 8 warps, waves_per_eu(8,8) -- asks the allocator for <=192 VGPR ----
-extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
-sk1d64w_attn_fwd_c0(SK1D64_ARGS) {
-  sk1d64_body<128, 8, false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                             q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
-}
-
-extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
-sk1d64w_attn_fwd_c1(SK1D64_ARGS) {
-  sk1d64_body<128, 8, true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                            q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
-}
-
-// ---- BM=256, 16 warps, waves_per_eu(8,8) -- the larger-query-tile arm ----
-extern "C" __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8, 8)))
-sk1d64m_attn_fwd_c0(SK1D64_ARGS) {
-  sk1d64_body<256, 16, false>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                              q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
-}
-
-extern "C" __global__ void __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8, 8)))
-sk1d64m_attn_fwd_c1(SK1D64_ARGS) {
-  sk1d64_body<256, 16, true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
-                             q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
+attn_int8qk_f16_strided_fwd_causal(ATTN_ARGS) {
+  attn_body<true>(Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale,
+                q_rstride, q_hstride, q_bstride, o_rstride, o_hstride, o_bstride);
 }

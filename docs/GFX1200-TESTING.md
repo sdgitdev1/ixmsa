@@ -79,9 +79,9 @@ device arch       gfx1201
 selected arch     gfx1201 (None = the package will refuse)
 switch            ON | SAGEATTN_SK1_GFX1200 = 1
 gfx1200 objects   ALL PRESENT
-would load        sk1_t4a1s.gfx1201.hsaco
+would load        attn_fp8qk_f16.gfx1201.hsaco
 ------------------------------------------------------------------------------
-served by         {'_BACKEND_I8': 'sk1_t6i.gfx1201.hsaco'}
+served by         {'_BACKEND_I8': 'attn_int8qk_f16.gfx1201.hsaco'}
 output            finite | absmax 0.0927
 vs fallback       max |diff| = 0.0057
   OK: the gfx1201 objects served this call
@@ -94,8 +94,8 @@ On a 9060 XT with the switch on, it should say:
 | `device arch` | `gfx1200` | the package sees your card correctly; if not, stop, nothing else matters |
 | `switch` | `ON` | the opt-in was read |
 | `gfx1200 objects` | `ALL PRESENT` | the gfx1200 builds are installed |
-| `would load` | a name ending `_1200.hsaco` | the package picked the gfx1200 builds |
-| **`served by`** | **names ending `_1200.hsaco`** | **the proof: these are the code objects that actually ran your call. Empty means it fell back** |
+| `would load` | a name ending `.gfx1200.hsaco` | the package picked the gfx1200 builds |
+| **`served by`** | **names ending `.gfx1200.hsaco`** | **the proof: these are the code objects that actually ran your call. Empty means it fell back** |
 | `output` | `finite` | no NaN or Inf |
 | `vs fallback` | a small number, around 0.01 | close to PR #368's result on the same input |
 
