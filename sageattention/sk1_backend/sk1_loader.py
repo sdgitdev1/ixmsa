@@ -2,24 +2,19 @@
 """Load and launch a raw `.hsaco` from Python with ctypes, on torch's own HIP runtime.
 
 A code object has no C++ imports, so the `c10` symbol ABI mismatch that breaks a `.pyd` extension
-built against a different torch cannot arise. Everything here is a plain C-ABI call with integer
-and pointer arguments.
+built against a different torch cannot arise; everything here is a plain C-ABI call.
 
-Three things this file is careful about:
+1. Same HIP runtime DLL as torch. `hipModuleLoadData` must be called on the already-loaded
+   `amdhip64_7.dll`, or device pointers and streams are not interchangeable. The ROCm SDK's
+   `_rocm_sdk_core` and `_rocm_sdk_devel` copies are different builds, so `rocm_bin_dir()` resolves
+   to the image that is already loaded and `HipRuntime.same_as_torch` records the evidence.
+2. Torch's current stream, passed as a plain integer handle, so the kernel is ordered against the
+   torch ops that produced its inputs.
+3. Argument lifetime. HIP reads `kernelParams` asynchronously, so the argument values must outlive
+   the launch; `launch()` returns them and callers keep them until the next call.
 
-1. The same HIP runtime DLL torch uses. `hipModuleLoadData` must be called on the loaded
-   `amdhip64_7.dll`, not on a second copy, or device pointers and streams are not interchangeable.
-   In the ROCm SDK Python packages, `_rocm_sdk_core\\bin\\amdhip64_7.dll` (the one torch loads) and
-   `_rocm_sdk_devel\\bin\\amdhip64_7.dll` were observed to be two different builds, and an unguarded
-   `ctypes.WinDLL` on the devel path puts a second HIP runtime in the process. `rocm_bin_dir()`
-   therefore resolves to the image that is already loaded, and `HipRuntime.same_as_torch` records
-   the enumeration as evidence.
-2. Torch's current stream. `hipModuleLaunchKernel` is given `torch.cuda.current_stream().cuda_stream`,
-   a Python-level integer handle, so no C++ object crosses the boundary and the kernel is ordered
-   against the torch ops that produced K8/SK/V8T/SV.
-3. Argument lifetime. `kernelParams` holds pointers to the argument values and HIP reads them
-   asynchronously, so the values must outlive the launch. `launch()` returns them and
-   `Sk1Attn.__call__` keeps them on the object until the next call.
+Environment: `SK1_ROCM_BIN` (extra directory to search for the HIP runtime) and `SK1_HIP_DLL`
+(explicit path to the runtime library).
 """
 from __future__ import annotations
 
@@ -37,16 +32,14 @@ except ImportError:  # non-Windows: the Linux paths below do not need it
 HIP_SUCCESS = 0
 
 # hipModuleLaunchKernel(hipFunction_t, gx, gy, gz, bx, by, bz, sharedMemBytes, stream,
-#                       kernelParams, extra)  -- exactly 11 entries in declaration order.
-# (Writing this as [c_void_p, c_uint]*6 would expand to 12 alternating entries and mis-type
-#  kernelParams as c_uint.)
+#                       kernelParams, extra): exactly 11 entries in declaration order
 _LAUNCH_ARGTYPES = ([ctypes.c_void_p] + [ctypes.c_uint] * 6 +
                     [ctypes.c_uint, ctypes.c_void_p,
                      ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)])
 
 
 def _enum_amdhip_modules() -> list:
-    """Every loaded module whose base name starts with `amdhip` -- full path + HMODULE."""
+    """Every loaded module whose base name starts with `amdhip`: full path + HMODULE."""
     if not _IS_WINDOWS:
         return _enum_amdhip_modules_linux()
     assert wintypes is not None  # Windows-only branch
@@ -73,11 +66,7 @@ def _enum_amdhip_modules() -> list:
 
 
 def _enum_amdhip_modules_linux() -> list:
-    """Linux equivalent: mappings in /proc/self/maps whose file is libamdhip*.
-
-    `hmodule` has no Linux meaning; it stays None and handle evidence is
-    recorded from dlopen handles in `_verify_same_module` instead.
-    """
+    """Linux equivalent: mappings in /proc/self/maps whose file is libamdhip*. `hmodule` is None."""
     out = []
     seen = set()
     try:
@@ -112,9 +101,7 @@ def _candidate_bins() -> list:
         cands.append(d)
     import site
     for sp in list(site.getsitepackages()) + [site.getusersitepackages()]:
-        # `_rocm_sdk_core` first: that is the copy torch's own wheel loads. The `_rocm_sdk_devel`
-        # `amdhip64_7.dll` has been a different build, and loading it puts a second HIP runtime in
-        # the process.
+        # `_rocm_sdk_core` first: that is the copy torch loads
         if _IS_WINDOWS:
             cands.append(os.path.join(sp, "_rocm_sdk_core", "bin"))
             cands.append(os.path.join(sp, "_rocm_sdk_devel", "bin"))
@@ -129,16 +116,13 @@ def _candidate_bins() -> list:
 def rocm_bin_dir() -> str:
     """Directory holding the `amdhip64_7.dll` that torch already loaded, else the best fallback.
 
-    Device pointers and the stream must be shared with torch, which means the same runtime image.
-    Windows' loader keys on the resolved path, so loading the DLL from a different directory yields
-    a second, independent HIP runtime in the same process. `_rocm_sdk_core\\bin` (torch's) and
-    `_rocm_sdk_devel\\bin` have been seen to hold two different builds, and both ended up loaded,
-    which is why this function prefers the already-loaded image.
+    Windows' loader keys on the resolved path, so loading the DLL from another directory yields a
+    second, independent HIP runtime in the process; hence the already-loaded image is preferred.
     """
     override = os.environ.get("SK1_HIP_DLL")
     if override and os.path.isfile(override):
         return os.path.dirname(override)
-    # make sure torch has had its chance to load its own copy before we enumerate
+    # let torch load its own copy before we enumerate
     try:
         import torch
         if torch.cuda.is_available():
@@ -165,7 +149,7 @@ class HipRuntime:
     def __init__(self, bin_dir: str | None = None):
         self.bin_dir = bin_dir or rocm_bin_dir()
         if hasattr(os, "add_dll_directory"):
-            os.add_dll_directory(self.bin_dir)   # amdhip64_7.dll has siblings on its search path
+            os.add_dll_directory(self.bin_dir)   # the runtime's sibling DLLs
         if _IS_WINDOWS:
             assert wintypes is not None  # Windows-only branch
             self._k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -177,8 +161,7 @@ class HipRuntime:
         if _IS_WINDOWS:
             self.hip = ctypes.WinDLL(self.dll_path)
         else:
-            # RTLD_GLOBAL mirrors WinDLL's process-global visibility so the
-            # runtime torch uses and this handle are one image.
+            # RTLD_GLOBAL mirrors WinDLL's process-global visibility
             self.hip = ctypes.CDLL(self.dll_path, mode=ctypes.RTLD_GLOBAL)
         self._bind()
         self.same_as_torch = self._verify_same_module()
@@ -218,17 +201,15 @@ class HipRuntime:
     def _verify_same_module(self) -> dict:
         """Evidence that ctypes and torch share one HIP runtime image.
 
-        `WinDLL` and `GetModuleHandleW` both key on the module *name*, so equality of the handles
-        means Windows handed back the already-loaded image rather than mapping a second one.  The
-        torch side is recorded as the stream handle's non-emptiness plus the DLL's own path.
+        Equal `WinDLL` and `GetModuleHandleW` handles (both keyed on the module name) mean Windows
+        returned the already-loaded image rather than mapping a second one.
         """
         got = ctypes.cast(self.hip._handle, ctypes.c_void_p).value
         if _IS_WINDOWS:
             assert wintypes is not None  # Windows-only branch
             want = self._k32.GetModuleHandleW(self.DLL_NAME)
         else:
-            # dlopen of an already-loaded soname returns the same handle,
-            # so equality still proves one shared runtime image.
+            # dlopen of an already-loaded soname returns the same handle
             try:
                 probe = ctypes.CDLL(self.DLL_NAME)
                 want = ctypes.cast(probe._handle, ctypes.c_void_p).value
@@ -252,7 +233,7 @@ class HipRuntime:
 
     # ---------------------------------------------------------------- module / function
     def load_module(self, hsaco):
-        """`hsaco`: path or raw bytes of an `elf64-amdgpu` code object (NOT a `__CL` container)."""
+        """`hsaco`: path or raw bytes of an `elf64-amdgpu` code object (not a `__CL` container)."""
         image = open(hsaco, "rb").read() if isinstance(hsaco, (str, os.PathLike)) else bytes(hsaco)
         if image[:4] != b"\x7fELF":
             raise RuntimeError("hipModuleLoadData wants a raw ELF; got magic %r "
@@ -276,10 +257,8 @@ class HipRuntime:
     def launch(self, fn, grid, block, shared_bytes, stream, args):
         """`args`: list of ctypes values in the KERNEL's declaration order.
 
-        HIP dereferences `kernelParams` asynchronously, so BOTH the pointer array and the argument
-        values themselves must outlive the launch.  The runtime keeps them alive internally
-        (`self._keepalive`) as well as returning them, because a caller that ignores the return
-        value would silently free the argument storage.
+        HIP dereferences `kernelParams` asynchronously, so both the pointer array and the values
+        must outlive the launch. They are kept in `self._keepalive` as well as returned.
         """
         vals = [ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in args]
         arr = (ctypes.c_void_p * len(vals))(*vals)
@@ -303,49 +282,36 @@ def torch_stream():
     return int(torch.cuda.current_stream().cuda_stream)
 
 
-#: Every reason `strided_view_reason` can return, in evaluation order.  The strings are part of the
-#: refusal contract -- `sk1_backend._envelope_ok` returns them verbatim -- so they are listed once.
+#: Every reason `strided_view_reason` can return, in evaluation order. `sk1_backend._envelope_ok`
+#: returns them verbatim.
 STRIDED_REFUSALS = ("rank", "stride_last", "stride_nonpos", "stride_align", "ptr_align",
                     "stride_overlap", "stride_int32")
 _INT32_MAX = 2 ** 31 - 1
 
 
 def strided_view_reason(t, name="t"):
-    """`None` if `t` is a servable logical `(B, H, N, D)` view, else a clean reason string.
+    """`None` if `t` is a servable logical `(B, H, N, D)` view, else a reason string.
 
-    This is the one place the acceptance rule lives.  `_strided_triple` (the loader's contract
-    check, which raises) and `sk1_backend._envelope_ok` (the pre-launch refusal, which returns the
-    string) both call it, so the envelope can never accept a pattern the raw launch would refuse,
-    or the reverse.
-
-    Earlier releases accepted only two patterns -- contiguous HND, and the physical-NHD layout --
-    because an arbitrary stride set could alias and the launch is raw.  That whitelist is now
-    replaced by the launch's own requirements, because real models hand this kernel views the
-    whitelist refused: MiniMax-H3's q/k/v are views into one fused `qkv_proj` output, so their row
-    stride is `3*H*D` and neither `is_contiguous()` nor `transpose(1, 2).is_contiguous()` holds.
-    Such a call used to be refused, which meant it silently ran the fallback instead.
-
-    Every condition below is stated from the kernel source:
+    The one place the acceptance rule lives; `_strided_triple` (raises) and
+    `sk1_backend._envelope_ok` (returns the string) both call it, so the envelope can never accept
+    a pattern the raw launch would refuse. Real models hand the kernel views that are neither
+    contiguous HND nor physical NHD (MiniMax-H3's q/k/v are views into one fused `qkv_proj` output,
+    row stride `3*H*D`), so the rule is the launch's own requirements:
 
     1. `rank`            -- not 4-D.
-    2. `stride_last`     -- `t.stride(3) != 1`.  The kernel's only vector access to `Q` is a
-       16-byte `f16x8` load, so the last axis must be the contiguous one.
-    3. `stride_nonpos`   -- any stride <= 0.  A zero stride aliases (`expand`), and the kernel adds
-       `blockIdx.y * q_hstride` / `blockIdx.z * q_bstride` without checking.
-    4. `stride_align`    -- any of the outer three strides not a multiple of 8 elements.  That load
-       is 16 bytes, so every `(b, h, row)` start must be 16-byte aligned.  Required for `Q`;
-       conservative for `K`/`V` (read by the Triton prologue, whose masked loads merely vectorise
-       less) and for `O` (written by scalar 16-bit stores).
-    5. `ptr_align`       -- `t.data_ptr() % 16`.  Same 16-byte load.
-    6. `stride_overlap`  -- the affine index map is not injective.  Test: drop the size-1 dims, sort
-       the rest by ascending stride, and require `stride[k+1] >= stride[k] * size[k]`.  Sufficient
-       but not necessary -- it can refuse a non-overlapping pattern, but it can never accept an
-       overlapping one.  Dropping the size-1 dims is required for correctness: `unsqueeze(0)` gives
-       `B = 1` a batch stride of `H*D`, smaller than the row stride `3*H*D`.
-    7. `stride_int32`    -- any stride above `2**31 - 1`.  The launch passes its addressing as nine
-       32-bit arguments and the prologue as six more.  Not covered: Triton computes element offsets
-       in int32, so a stride whose product with `N` overflows would wrap inside the prologue even
-       though each argument fits.  Nothing in this repository reaches that today.
+    2. `stride_last`     -- `stride(3) != 1`; the kernel's `Q` access is a 16-byte `f16x8` load.
+    3. `stride_nonpos`   -- any stride <= 0; a zero stride aliases (`expand`) and the kernel adds
+       the head/batch strides unchecked.
+    4. `stride_align`    -- an outer stride not a multiple of 8 elements, so that every
+       `(b, h, row)` start is 16-byte aligned. Needed for `Q`; conservative for `K`/`V`/`O`.
+    5. `ptr_align`       -- `data_ptr() % 16`; same 16-byte load.
+    6. `stride_overlap`  -- the index map is not injective. Drop size-1 dims, sort by ascending
+       stride, require `stride[k+1] >= stride[k] * size[k]`. Sufficient, not necessary: it may
+       refuse a non-overlapping pattern but never accepts an overlapping one. Size-1 dims must be
+       dropped: `unsqueeze(0)` gives `B = 1` a batch stride smaller than the row stride.
+    7. `stride_int32`    -- any stride above `2**31 - 1`; the launch passes strides as 32-bit
+       arguments. Not covered: Triton's int32 element offsets could still wrap if a stride times
+       `N` overflows.
     """
     if t.dim() != 4:
         return "rank"
@@ -354,7 +320,7 @@ def strided_view_reason(t, name="t"):
     st = [int(s) for s in t.stride()]
     if any(s <= 0 for s in st):
         return "stride_nonpos"
-    # `stride(3) == 1` is required by (2), so it is excluded here: the rule is the outer three.
+    # stride(3) == 1 is already required, so only the outer three are checked
     if any(st[i] % 8 for i in (0, 1, 2)):
         return "stride_align"
     if int(t.data_ptr()) % 16:
@@ -370,22 +336,12 @@ def strided_view_reason(t, name="t"):
 
 
 def _strided_triple(t, name):
-    """`(row, head, batch)` element strides of a logical `(B, H, N, D)` tensor.
+    """`(row, head, batch)` element strides of a logical `(B, H, N, D)` tensor, plus a layout tag.
 
-    The widened kernel takes the addressing as three integers instead of assuming the contiguous
-    `(B*H, N, 128)` form.  The legal views are exactly those `strided_view_reason` accepts -- see
-    its docstring for the derivation of every condition -- and the two patterns earlier releases
-    named are kept as tags so the existing records stay readable:
-
-    * `t.is_contiguous()` -- contiguous HND, `(rs, hs, bs) = (D, N*D, H*N*D)`, tag `"hnd_contig"`;
-    * `t.transpose(1, 2).is_contiguous()` -- the physical NHD layout read as HND, which is what
-      `rearrange(q, "B L (H D) -> B H L D")` produces and what NHD `(B, N, H, D)` input transposes
-      to, `(rs, hs, bs) = (H*D, D, N*H*D)`, tag `"nhd_phys"`;
-    * anything else the guard accepts -- MiniMax-H3's fused-QKV view, for example, whose row stride
-      is `3*H*D` -- tag `"general"`.
-
-    A view that fails the guard is refused with the guard's own reason: the launch is raw and
-    nothing downstream bounds-checks.
+    Legal views are exactly those `strided_view_reason` accepts; the launch is raw and nothing
+    downstream bounds-checks, so anything else is refused with the guard's own reason. Tags:
+    `"hnd_contig"` (contiguous HND), `"nhd_phys"` (physical NHD read as HND, i.e.
+    `transpose(1, 2).is_contiguous()`) and `"general"` (e.g. MiniMax-H3's fused-QKV view).
     """
     r = strided_view_reason(t, name)
     if r is not None:
@@ -405,73 +361,51 @@ def _strided_triple(t, name):
 class Sk1Attn:
     """SK1's two entry points behind a torch-tensor interface.
 
-    Tensor contract (exactly the kernel's):  Q (B*H, N, 128) fp16 or bf16 RAW; K8 (B*H, N_pad, 128)
+    Tensor contract (exactly the kernel's): Q (B*H, N, 128) fp16 or bf16 RAW; K8 (B*H, N_pad, 128)
     e4m3 zero-padded; SK (B*H, N_pad) fp32; V8T (B*H, 128, N_pad) e4m3 zero-padded (V TRANSPOSED);
-    SV (B*H, N_pad) fp32; VMEAN (B*H, 128) fp32 or None; O (B*H, N, 128) the same 16-bit dtype as Q.
+    SV (B*H, N_pad) fp32; VMEAN (B*H, 128) fp32 or None; O (B*H, N, 128) same dtype as Q.
     `H` is the head count used to fold (b, h) out of `bh`; N_pad must be a multiple of 64.
 
-    `qo_dtype` is the Q/O element dtype this object was built for. It defaults from the symbol pair
-    (`attn_fp8qk_bf16*` -> `torch.bfloat16`, everything else -> `torch.float16`), so the dtype
-    contract is per object: the fp16 objects refuse a bf16 call and the bf16 objects refuse an fp16
-    one. `__bf16` and `_Float16` are both 16 bits wide, so the vector load, the addresses and the
-    whole KV loop are identical; only the widen and the narrow differ.
+    `qo_dtype` is the Q/O dtype the object was built for, defaulting from the symbol pair
+    (`attn_fp8qk_bf16*` -> bf16, else fp16): fp16 objects refuse a bf16 call and vice versa.
 
-    Every packaged object takes a 12th argument, `S` (B*H,) fp32: the per-`(b,h)` rescale
-    `S = clamp_min(max_j sv(j), 1)` that the prologue applied to `SV`. It is inserted between `VMEAN`
-    and `O`, so the kernel argument order is `Q, K8, SK, V8T, SV, VMEAN, S, O, H, N, N_pad, sm_scale`.
-    `with_s` selects it and defaults to `True`.
+    Every packaged object takes a 12th argument `S` (B*H,) fp32, the per-`(b,h)` rescale
+    `clamp_min(max_j sv(j), 1)` the prologue applied to `SV`, between `VMEAN` and `O`. `with_s`
+    selects it and defaults to `True`.
     """
 
-    #: The default symbols are the `attn_fp8qk_f16` pair.
     DEFAULT_SYMBOLS = ("attn_fp8qk_f16_fwd", "attn_fp8qk_f16_fwd_causal")
 
-    #: The argument order of the `attn_fp8qk_f16` kernel, checked against its emitted ISA:
-    #: `s_load_b512 s[0:15], s[0:1], 0x0` covers Q..O at offsets 0x00..0x3F and
-    #: `s_load_b128 s[16:19], s[0:1], 0x40` covers H, N, N_pad and sm.
+    #: Kernel argument order of the `attn_fp8qk_f16` object
     ARG_ORDER_WITH_S = ("Q", "K8", "SK", "V8T", "SV", "VMEAN", "S", "O", "H", "N", "N_pad", "sm")
 
-    #: The widened object `attn_fp8qk_f16_strided` takes six extra integers after `sm_scale`: the
-    #: `(row, head, batch)` element strides of `Q` and of `O` (see
-    #: `kernels/hip/attn_fp8qk_f16_strided.hip`).
-    #: With `(q_rs, q_hs, q_bs) = (128, N*128, H*N*128)` and the same for `O`, the kernel's addresses
-    #: are identical to `attn_fp8qk_f16`'s. Contiguous HND is still routed to `attn_fp8qk_f16` (routing is in
-    #: `__init__.py`), so that path keeps its original code object.
+    #: `attn_fp8qk_f16_strided` takes six extra integers after `sm_scale`: the `(row, head, batch)`
+    #: element strides of `Q` and `O`. Contiguous HND is still routed to `attn_fp8qk_f16`
+    #: (routing is in `__init__.py`).
     ARG_ORDER_STRIDED = ("Q", "K8", "SK", "V8T", "SV", "VMEAN", "S", "O", "H", "N", "N_pad", "sm",
                          "q_rs", "q_hs", "q_bs", "o_rs", "o_hs", "o_bs")
 
     def __init__(self, hsaco_path: str, rt: HipRuntime | None = None, symbols=None, with_s=None,
                  strided=None, head_dim=None, bm=None, qo_dtype=None):
-        """`symbols` = (non-causal, causal) entry points.  The packaged default is the
-        `attn_fp8qk_f16` pair (`attn_fp8qk_f16_fwd` / `attn_fp8qk_f16_fwd_causal`); the `_check`
-        contract guard runs before every launch.  `with_s` selects the 12-argument form (see the
-        class doc).
+        """`symbols` = (non-causal, causal) entry points; the default is the `attn_fp8qk_f16` pair.
 
-        `head_dim` (64 or 128) and `bm` (128 or 256) both default from the symbol pair, for the same
-        reason `with_s`/`strided` do: a caller that only swaps `symbols` must not be able to launch a
-        D=64 kernel against D=128 buffers, nor a BM=256 kernel with a BM=128 grid.
-
-        `qo_dtype` likewise defaults from the symbol pair, so a caller that only swaps `symbols`
-        cannot feed a bf16 object an fp16 Q (or the reverse), which would silently reinterpret the
-        bytes.
+        `strided`, `head_dim` (64 or 128), `bm` (128 or 256) and `qo_dtype` default from the
+        symbol pair, so a caller that only swaps `symbols` cannot launch a D=64 kernel against
+        D=128 buffers, a BM=256 kernel with a BM=128 grid, or a bf16 object on fp16 bytes.
         """
         self.rt = rt or HipRuntime()
         self.hsaco_path = hsaco_path
         self.symbols = tuple(symbols) if symbols else self.DEFAULT_SYMBOLS
         if len(self.symbols) != 2:
             raise ValueError("symbols must be (non-causal, causal); got %r" % (self.symbols,))
-        # Every packaged object takes `S`, so `with_s` defaults to True.
         self.with_s = True if with_s is None else bool(with_s)
-        # The six-stride form is inferred from the symbol pair: a caller that only swaps `symbols`
-        # cannot launch the 18-argument kernel with 12 arguments.
         self.strided = ("_strided_" in self.symbols[0]) if strided is None else bool(strided)
-        # Head dim and query-tile height default to the only packaged shape (D=128, BM=128).
         self.head_dim = int(128 if head_dim is None else head_dim)
         if self.head_dim not in (64, 128):
             raise ValueError("head_dim must be 64 or 128; got %d" % self.head_dim)
         self.bm = int(128 if bm is None else bm)
         if self.bm not in (128, 256):
             raise ValueError("bm must be 128 or 256; got %d" % self.bm)
-        # The Q/O element dtype, inferred from the symbol pair.
         if qo_dtype is None:
             import torch
             qo_dtype = (torch.bfloat16 if any("bf16" in s for s in self.symbols) else torch.float16)
@@ -483,26 +417,18 @@ class Sk1Attn:
     @staticmethod
     def _check(q, k8, sk, v8t, sv, vmean, out, H, N, N_pad, s=None, with_s=False, head_dim=128,
                qo_dtype=None):
-        # The launch is raw: nothing downstream bounds-checks, and an undersized buffer is a GPU page
-        # fault (Windows shows an AMD bug-report popup). Refuse any tensor that does not match the
-        # contract exactly, before it reaches the device.
+        # The launch is raw: an undersized buffer is a GPU page fault, so refuse any tensor that
+        # does not match the contract exactly, before it reaches the device.
         import torch
-        # The object's Q/O element dtype. The fp16 default keeps every earlier caller unchanged; a
-        # bf16 object passes `torch.bfloat16` and then refuses an fp16 q/out (and vice versa).
         qo_dtype = torch.float16 if qo_dtype is None else qo_dtype
-        # This must come first. A null `S` on the 12-argument object is dereferenced by the kernel's
-        # `Sb = S[bh]` load, so it is refused before any other tensor is inspected.
+        # First: a null `S` is dereferenced by the kernel's `Sb = S[bh]` load
         if with_s and s is None:
             raise ValueError("this SK1 object takes the per-head V scale `S` argument; s=None was passed")
         N, N_pad, H = int(N), int(N_pad), int(H)
         head_dim = int(head_dim)
         if head_dim not in (64, 128):
-            # The object's own head dim, not the caller's. A D=64 object must refuse a D=128 call
-            # and vice versa, so the shape check below is against this object's contract.
             raise ValueError("SK1 objects exist only for head_dim in {64,128}; got %d" % head_dim)
         if N < 1 or N_pad % 64 or N_pad < N:
-            # `% 64` must be escaped: unescaped, Python parses it as a format spec and raises
-            # `ValueError: unsupported format character` instead of this message.
             raise ValueError("need N >= 1, N_pad %% 64 == 0 and N_pad >= N (N=%d, N_pad=%d)"
                              % (N, N_pad))
         bh = q.shape[0]
@@ -516,7 +442,6 @@ class Sk1Attn:
         }
         if vmean is not None:
             want["vmean"] = (vmean, (bh, head_dim), torch.float32)
-        # The 12th kernel argument (already required to be non-None at the top).
         if with_s:
             want["s"] = (s, (bh,), torch.float32)
         for name, (t, shape, dtype) in want.items():
@@ -536,16 +461,11 @@ class Sk1Attn:
                        qo_dtype=None):
         """`_check` for the 18-argument object.
 
-        Same contract as `_check`, except that `q` and `out` are logical `(B, H, N, D)` tensors that
-        may be strided.  Their `(row, head, batch)` strides must be one of the two legal patterns
-        (`_strided_triple`); `K8`/`SK`/`V8T`/`SV`/`VMEAN`/`S` must still be contiguous.  Returns
-        `(q_triple, o_triple)` for `launch_strided`.
-
-        `head_dim` is the object's head dim (64 or 128), not the caller's; a D=64 object refuses a
-        D=128 call and vice versa.
+        Same contract, except `q` and `out` are logical `(B, H, N, D)` tensors that may be strided
+        (`_strided_triple`); the other tensors must still be contiguous. Returns
+        `(q_triple, o_triple)` for `launch_strided`. `head_dim` is the object's, not the caller's.
         """
         import torch
-        # The object's Q/O element dtype (see `_check`).
         qo_dtype = torch.float16 if qo_dtype is None else qo_dtype
         if s is None:
             raise ValueError("this SK1 object takes the per-head V scale `S` argument; s=None was passed")
@@ -569,8 +489,7 @@ class Sk1Attn:
         bh = B * H
         qtr = _strided_triple(q, "q")
         otr = _strided_triple(out, "out")
-        # The Q load is a 16-byte `f16x8` (see `attn_fp8qk_f16_strided.hip`), so every (b,h,row) start must be
-        # 16-byte aligned: an 8-element multiple on each stride plus an aligned base pointer.
+        # the Q load is a 16-byte `f16x8`: every (b,h,row) start must be 16-byte aligned
         for nm, tr in (("q", qtr), ("out", otr)):
             rs, hs, bs = tr[0], tr[1], tr[2]
             if rs <= 0 or hs <= 0 or bs <= 0:
@@ -622,8 +541,6 @@ class Sk1Attn:
                 c.c_void_p(v8t.data_ptr()), c.c_void_p(sv.data_ptr()),
                 c.c_void_p(vmean.data_ptr() if vmean is not None else 0)]
         if self.with_s:
-            # `S` sits between `VMEAN` and `O` (ARG_ORDER_WITH_S), matching the kernel's kernarg
-            # layout.
             args.append(c.c_void_p(s.data_ptr()))
         args += [c.c_void_p(out.data_ptr()),
                  c.c_int(int(H)), c.c_int(int(N)), c.c_int(int(N_pad)), c.c_float(float(sm_scale))]
@@ -631,9 +548,7 @@ class Sk1Attn:
         B = int(bh) // int(H)
         if B * int(H) != int(bh):
             raise ValueError("q.shape[0]=%d is not H=%d times an integer batch size" % (bh, H))
-        # grid = (ceil(N/bm), H, B); the kernel folds bh = blockIdx.z*H + blockIdx.y.  bm is the
-        # object's query-tile height (128 for most objects, 256 for the `d64m` arm), and the block is
-        # 4 warps x 32 lanes x (bm/128): 256 threads at bm=128, 512 at bm=256.
+        # the kernel folds bh = blockIdx.z*H + blockIdx.y; the block is 4 warps x 32 lanes x (bm/128)
         bm = int(self.bm)
         grid = ((N + bm - 1) // bm, int(H), B)
         block = (bm * 2, 1, 1)
@@ -644,10 +559,9 @@ class Sk1Attn:
 
     def launch_strided(self, q, k8, sk, v8t, sv, vmean, out, H, N, N_pad, sm_scale, causal,
                        stream=None, s=None):
-        """Launch the 18-argument widened kernel on logical `(B, H, N, D)` `q`/`out`.
+        """Launch the 18-argument kernel on logical `(B, H, N, D)` `q`/`out` (strided views allowed).
 
-        `q`/`out` may be contiguous HND or physically-NHD views (`_strided_triple`); every other
-        tensor is the same as `launch`.  `out` is written in place and returned.
+        Every other tensor is the same as in `launch`. `out` is written in place and returned.
         """
         if not self.strided:
             raise ValueError("this SK1 object is not the strided form (symbols=%r)"
@@ -665,8 +579,6 @@ class Sk1Attn:
                  c.c_int(int(qtr[0])), c.c_int(int(qtr[1])), c.c_int(int(qtr[2])),
                  c.c_int(int(otr[0])), c.c_int(int(otr[1])), c.c_int(int(otr[2]))]
         B = int(q.shape[0])
-        # grid = (ceil(N/bm), H, B); the kernel folds bh = blockIdx.z*H + blockIdx.y.  bm is the
-        # object's query-tile height (128 for most objects, 256 for the `d64m` arm).
         bm = int(self.bm)
         grid = ((N + bm - 1) // bm, int(H), B)
         block = (bm * 2, 1, 1)

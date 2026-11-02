@@ -1,71 +1,49 @@
 """Prebuilt SK1 backend for the gfx12 native path (on by default on gfx1201).
 
-This package ships prebuilt gfx1201 code objects (and, opt-in, the same set built for gfx1200) plus
-the loader that launches them through the HIP runtime DLL that torch has already loaded. These code
-objects are packaged:
+The package ships prebuilt gfx1201 code objects (and, opt-in, the same set built for gfx1200) and
+the loader that launches them through the HIP runtime DLL torch has already loaded. A `.hsaco` is a
+self-contained `elf64-amdgpu` file with no C++ imports, so the `c10` ABI mismatch that breaks a
+`.pyd` extension against a different torch build cannot arise.
 
-* `attn_fp8qk_f16.gfx1201.hsaco` serves contiguous HND calls. It takes a per-(b,h) scale `S` as a
-  12th argument. A key token with `|V| > 448` and enough softmax weight used to overflow the fp8
-  conversion in the P-fold, because `p8 = e4m3(p * sv * 448) = e4m3(p * amax_v)` had no clamp, and the
-  output went non-finite (a Krea2 render went black from one step on). The kernel now takes
-  `S = clamp_min(max_j sv(j), 1)` computed on the device, stages `SV' = SV/S`, and applies `x S` in
-  the epilogue. When every `amax_v <= 448`, `S == 1.0` exactly and the result is bit-identical to
-  the kernel without `S`.
-* `attn_fp8qk_f16_strided.gfx1201.hsaco` is the same kernel with six extra integer strides for Q and
-  O. It serves strided HND and NHD inputs without a copy.
-* `attn_int8qk_f16.gfx1201.hsaco` (contiguous HND) and `attn_int8qk_f16_strided.gfx1201.hsaco`
-  (strided HND and NHD) are the INT8 Q.K variants. Q.K runs on `v_wmma_i32_16x16x16_iu8` with K
-  quantised per token to int8; the V / P.V path is the fp8 one. They serve fp16, head_dim 128, and
-  are used by default.
-* `attn_fp8qk_bf16.gfx1201.hsaco` (contiguous HND) and `attn_fp8qk_bf16_strided.gfx1201.hsaco`
-  (strided HND and NHD) are the same kernels as `attn_fp8qk_f16` / `attn_fp8qk_f16_strided` with a
-  bf16 Q/O element type. They serve bf16, head_dim 128, and are used by default for bf16 input.
-* `kv_prologue.gfx1201.hsaco` is the HIP KV prologue (`kernels/hip/kv_prologue.hip`). It quantises
-  K and V for the attention objects above in at most two launches and is used by default; see
-  `SAGEATTN_SK1_PROLOGUE` below.
+* `attn_fp8qk_f16` (contiguous HND) and `attn_fp8qk_f16_strided` (strided HND and NHD, six extra
+  stride arguments for Q and O). Both take a per-(b,h) scale `S` as a 12th argument:
+  `S = clamp_min(max_j sv(j), 1)` is computed on the device and `SV' = SV/S` is staged, so a key
+  token with `|V| > 448` cannot overflow the fp8 conversion in the P-fold (the output used to go
+  non-finite). `S == 1.0` exactly when every `amax_v <= 448`.
+* `attn_int8qk_f16` / `attn_int8qk_f16_strided`: INT8 Q.K variants (K quantised per token to int8,
+  V / P.V as fp8). fp16, head_dim 128, used by default.
+* `attn_fp8qk_bf16` / `attn_fp8qk_bf16_strided`: the fp8 kernels with a bf16 Q/O element type.
+  bf16, head_dim 128, used by default for bf16 input.
+* `kv_prologue`: the HIP KV prologue (`kernels/hip/kv_prologue.hip`), used by default.
 
 No object serves head_dim 64: those calls fall back to the shipped path.
 
-Why a prebuilt code object and not a compiled extension: a `.hsaco` is a self-contained
-`elf64-amdgpu` file with no C++ imports, so the `c10` symbol ABI mismatch that breaks a `.pyd`
-extension against a different torch build cannot arise. The loader is a plain `ctypes` call with
-integer and pointer arguments.
-
-## Default semantics
-
-The backend is used only when all of these hold: the device arch is `gfx1201` (or `gfx1200` with
+The backend is used only when the device arch is `gfx1201` (or `gfx1200` with
 `SAGEATTN_SK1_GFX1200=1`), a HIP runtime resolves, the code object loads, and the call is inside
-`ENVELOPE`. Any other case falls back to the
-shipped path (the gfx12 native extension on gfx12, Triton on other arches), with at most one short
-log line per process, and never raises at call time.
+`ENVELOPE`. Any other case falls back to the shipped path (the gfx12 native extension on gfx12,
+Triton on other arches) with at most one short log line per process, and never raises at call time.
 
-* `SAGEATTN_SK1_BACKEND=1` forces it on; a load failure then raises.
-* `SAGEATTN_SK1_BACKEND=0` forces it off (the shipped path).
-* Unset means on.
+Environment variables (read once, at import):
+
+* `SAGEATTN_SK1_BACKEND`: `1` forces the backend on (a load failure then raises), `0` forces it off
+  and wins over every other switch, unset means on.
 * `SAGEATTN_SK1_INT8`: unset serves fp16 head_dim-128 calls with the int8 objects and falls back to
-  the fp8 objects, then to the shipped path, for a call they cannot serve. `=0` uses the fp8 objects
-  only. `=1` forces int8 and is strict: a call int8 cannot serve raises.
+  the fp8 objects, then to the shipped path. `0` uses the fp8 objects only. `1` is strict: a call
+  int8 cannot serve raises.
 * `SAGEATTN_SK1_BF16`: unset serves bf16 head_dim-128 calls with the bf16 objects and falls back
-  normally. `=0` sends bf16 calls to the shipped path (reason `"dtype"`). `=1` forces the bf16
-  objects and is strict.
-* `SAGEATTN_SK1_BACKEND=0` wins over both.
-* `SAGEATTN_SK1_PROLOGUE`: unset or `hip` quantises K and V with the HIP prologue and falls back to
-  the Triton prologue for a call it cannot serve. `triton` uses the Triton prologue only. Only the
-  prologue changes; the attention objects and their launch are the same.
-* `SAGEATTN_SK1_GFX1200=1` lets a gfx1200 device use the `*.gfx1200.hsaco` objects, which are the same
-  kernels built with `--offload-arch=gfx1200`. Unset, a gfx1200 device is refused (reason `"arch"`)
-  and takes the shipped path, as before. The switch does nothing on gfx1201: the device decides
-  which object set is loaded.
+  normally. `0` sends bf16 calls to the shipped path (reason `"dtype"`). `1` is strict.
+* `SAGEATTN_SK1_PROLOGUE`: unset or `hip` quantises K and V with the HIP prologue, falling back to
+  the Triton prologue for a call it cannot serve. `triton` uses the Triton prologue only.
+* `SAGEATTN_SK1_GFX1200=1`: lets a gfx1200 device use the `*.gfx1200.hsaco` objects (the same
+  kernels built with `--offload-arch=gfx1200`). Unset, a gfx1200 device is refused (reason
+  `"arch"`). No effect on gfx1201.
 
-The `.hsaco` files are built for gfx1201, plus the `.gfx1200.hsaco` set for gfx1200. There is no in-wheel
-rebuild path; `tools/build_hsaco.py` in the source repository rebuilds them from `kernels/hip/`. The
-arch check keeps any other device on the shipped path instead of raising.
+The `.hsaco` files are rebuilt from `kernels/hip/` by `tools/build_hsaco.py` in the source
+repository; there is no in-wheel rebuild path.
 
-The HIP runtime is resolved at call time and no install path is hard-coded. `rocm_bin_dir()` tries,
-in order: `$SK1_HIP_DLL`, the `amdhip64*.dll` already loaded in this process (torch's own copy),
-`$SK1_ROCM_BIN`, then the `_rocm_sdk_core` / `_rocm_sdk_devel` layouts under `site-packages`. The
-`_rocm_sdk_core` copy is preferred because it is the one torch loads; `_rocm_sdk_devel` is a different
-build, and loading it would put a second HIP runtime in the process (see `sk1_loader.py`).
+`rocm_bin_dir()` resolves the HIP runtime at call time, trying in order: `$SK1_HIP_DLL`, the
+`amdhip64*.dll` already loaded in this process (torch's own copy), `$SK1_ROCM_BIN`, then the
+`_rocm_sdk_core` / `_rocm_sdk_devel` layouts under `site-packages` (see `sk1_loader.py`).
 """
 from __future__ import annotations
 
@@ -73,8 +51,7 @@ import os
 import re
 import sys
 
-# `quant_kv_v8t` does `from quant_triton import ...` as a flat top-level import, so the package
-# directory must be importable as a top-level location before it is imported.
+# `quant_kv_v8t` does `from quant_triton import ...` as a flat top-level import
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -85,16 +62,10 @@ __all__ = ["available", "try_sk1_t1", "ENVELOPE", "SUPPORTED_ARCHS",
            "SK1_GFX1200", "SK1_GFX1200_ARCHS", "gfx1200_status", "arch_suffix", "selected_arch"]
 
 # ---- gfx1200 objects, opt-in ---------------------------------------------------------------------
-#: Every gfx1201 code object is also built with `--offload-arch=gfx1200` (RX 9060 XT, the same RDNA4
-#: instruction set) and shipped as `*.gfx1200.hsaco`. The `.text` sections are byte-identical to the
-#: gfx1201 ones. A gfx1200 device is routed to them only when this switch is set.
-#:
-#: `SAGEATTN_SK1_GFX1200=1` -> a gfx1200 device is served by the `*.gfx1200.hsaco` objects.
-#: unset / `0` / anything else -> a gfx1200 device is refused with `reason="arch"` and one log line
-#: that names this switch. Read once, at import (no per-call override, no `os.environ` read on the hot
-#: path), like `SAGEATTN_SK1_INT8`, `SAGEATTN_SK1_BF16` and `SAGEATTN_SK1_PROLOGUE`.
-#:
-#: The switch does nothing on gfx1201: a gfx1201 device always gets the `.gfx1201.hsaco` objects.
+#: Every gfx1201 code object is also shipped built for gfx1200 (RX 9060 XT, the same RDNA4 ISA) as
+#: `*.gfx1200.hsaco`. A gfx1200 device is routed to them only when `SAGEATTN_SK1_GFX1200=1`;
+#: otherwise it is refused with `reason="arch"` and one log line naming the switch. No effect on
+#: gfx1201.
 SK1_GFX1200_DEFAULT_ON = False
 #: the architectures that have their own object set
 SK1_GFX1200_ARCHS = ("gfx1200",)
@@ -107,7 +78,7 @@ elif _sk1_g12_env in ("0", "false", "no", "off"):
 else:
     SK1_GFX1200 = bool(SK1_GFX1200_DEFAULT_ON)
 
-#: the arch the shipped gfx1201 object set is built for -- the default and the fallback
+#: the arch the shipped object set is built for; the default and the fallback
 _DEFAULT_ARCH = "gfx1201"
 
 
@@ -125,12 +96,8 @@ def _arch_of(name):
 def selected_arch(device=None):
     """Which object set serves `device`, or `None` if none may.
 
-    This is the one place the arch/switch decision is made; `arch_supported`, the object-name
-    resolver and the log line all read it, so they cannot disagree.
-
-    * `gfx1201` -> `"gfx1201"`, always (the switch has no effect).
-    * `gfx1200` -> `"gfx1200"` iff `SK1_GFX1200`, else `None` (the arch refusal).
-    * anything else, or an unreadable arch -> `None`.
+    The one place the arch/switch decision is made. `gfx1201` -> `"gfx1201"` always; `gfx1200` ->
+    `"gfx1200"` iff `SK1_GFX1200`, else `None`; anything else or an unreadable arch -> `None`.
     """
     arch = device_arch(device)
     if not arch:
@@ -140,13 +107,10 @@ def selected_arch(device=None):
     return _DEFAULT_ARCH if arch.startswith(_DEFAULT_ARCH) else None
 
 
-#: The arch whose file names the base constants below carry. This is always `gfx1201`, on purpose:
-#: the base paths (`SK1_HSACO_PATH*`) are the literal gfx1201 file names, and `object_path()` rewrites
-#: them by replacing `.gfx1201.hsaco`. If this followed the switch, a gfx1201 device with
-#: `SAGEATTN_SK1_GFX1200=1` would get a `.gfx1200` base path, `object_path` would find nothing to
-#: replace, and the loader would hand a gfx1200 object to a gfx1201 device
-#: (`hipModuleLoadData` rc=209, `hipErrorNoBinaryForGpu`). The switch only permits gfx1200; the device
-#: chooses the object set, per call, through `_arch_now()` / `selected_arch()`.
+#: The arch whose file names the base constants below carry. Always `gfx1201`, on purpose:
+#: `object_path()` rewrites the literal gfx1201 names, so if this followed the switch a gfx1201
+#: device with `SAGEATTN_SK1_GFX1200=1` would be handed a gfx1200 object (`hipModuleLoadData`
+#: rc=209). The device chooses the object set, per call, through `_arch_now()`.
 _SEL_ARCH = _DEFAULT_ARCH
 _SUF = arch_suffix(_SEL_ARCH)
 
@@ -154,19 +118,16 @@ _SUF = arch_suffix(_SEL_ARCH)
 def _arch_now(device=None):
     """The object set for this device right now: `selected_arch()`, or the gfx1201 default.
 
-    Every loader and the prologue default to this, never to `_SEL_ARCH`, so the object set always
-    follows the device and a gfx1200 object is never loaded on a gfx1201 device (or the reverse).
+    Loaders default to this, never to `_SEL_ARCH`, so the object set always follows the device.
     """
     return selected_arch(device) or _DEFAULT_ARCH
 
 
 def object_path(base_gfx1201_path, arch):
-    """The object path for `arch`, given the gfx1201 path.
+    """The object path for `arch`, given the gfx1201 path (gfx1200: `attn_fp8qk_f16.gfx1200.hsaco`).
 
-    This makes "a gfx1200 object is never loaded on gfx1201, or the reverse" structural: the suffix
-    is computed from the same `arch` value the arch check used, so no code path produces a gfx1200
-    name while the active arch is gfx1201. A gfx1200 object is `attn_fp8qk_f16.gfx1200.hsaco`; the gfx1201
-    object keeps its exact name.
+    The suffix comes from the same `arch` value the arch check used, so a gfx1200 name can never
+    be produced while the active arch is gfx1201.
     """
     return base_gfx1201_path.replace(".gfx1201.hsaco", "%s.hsaco" % arch_suffix(arch))
 
@@ -176,58 +137,34 @@ def _with_suffix(name):
     return object_path(name, _SEL_ARCH)
 
 
-#: The fp16 objects take `S` as the 12th argument (between `VMEAN` and `O`).
 SK1_HSACO_NAME_S = _with_suffix("attn_fp8qk_f16.gfx1201.hsaco")
 SK1_HSACO_PATH_S = os.path.join(_HERE, SK1_HSACO_NAME_S)
 SK1_SYMBOLS_S = ("attn_fp8qk_f16_fwd", "attn_fp8qk_f16_fwd_causal")
 
-#: The widened object, `attn_fp8qk_f16_strided`: the 12 arguments of `attn_fp8qk_f16` plus six `int`
-#: Q/O strides (`kernels/hip/attn_fp8qk_f16_strided.hip`, derived from `attn_fp8qk_f16.hip` by textual
-#: substitution). It addresses contiguous HND exactly like `attn_fp8qk_f16`, but contiguous HND calls
-#: are still routed to `attn_fp8qk_f16` so that path is unchanged. The widened object serves only
-#: strided HND and NHD calls.
+#: `attn_fp8qk_f16_strided`: `attn_fp8qk_f16`'s 12 arguments plus six Q/O strides. Contiguous HND
+#: calls are still routed to `attn_fp8qk_f16`; this one serves only strided HND and NHD.
 SK1_HSACO_NAME_N = _with_suffix("attn_fp8qk_f16_strided.gfx1201.hsaco")
 SK1_HSACO_PATH_N = os.path.join(_HERE, SK1_HSACO_NAME_N)
 SK1_SYMBOLS_N = ("attn_fp8qk_f16_strided_fwd", "attn_fp8qk_f16_strided_fwd_causal")
 
-#: The INT8 Q.K objects, the default for fp16, D=128.
+#: The INT8 Q.K objects (`attn_int8qk_f16`, `attn_int8qk_f16_strided`), the default for fp16, D=128.
+#: Q.K runs int8 x int8 on `v_wmma_i32_16x16x16_iu8`; the V / P.V path is the fp8 one.
 #:
-#: `attn_int8qk_f16`         (contiguous HND, `kernels/hip/attn_int8qk_f16.hip`)
-#: `attn_int8qk_f16_strided`  (strided-HND / NHD: the same seven stride edits as
-#:                             `attn_fp8qk_f16_strided`, applied to the int8 source; bit-identical
-#:                             to `attn_int8qk_f16` on contiguous HND)
+#: `SAGEATTN_SK1_INT8`: unset -> `SK1_INT8_DEFAULT_ON`, non-strict (int8 serves every fp16 D=128 call
+#: it can and falls back normally: fp8 SK1 first, then the gfx12 native path); `0/false/no/off` ->
+#: OFF, the fp8 behaviour bit for bit; `1/true/yes/on` -> ON and strict, the only mode in which a
+#: refusal is an error. `SAGEATTN_SK1_BACKEND=0` wins over it.
 #:
-#: Q.K moves from fp8 e4m3 x fp8 e4m3 to int8 x int8 on `v_wmma_i32_16x16x16_iu8` with int32
-#: accumulators; the V / P.V path is the fp8 one, unchanged. On the accuracy and edge-length test cells
-#: the contiguous object was more accurate than the fp8 kernel on every cell, at a 1.6-2.5 %
-#: kernel-only cost.
-#:
-#: The switch has three states, the same as the bf16 one:
-#:
-#:   * `SAGEATTN_SK1_INT8` unset  -> `SK1_INT8 = SK1_INT8_DEFAULT_ON` (True), `STRICT = False`:
-#:     int8 serves every fp16 D=128 call it can, and falls back normally (fp8 SK1 first, then the
-#:     PR #368 gfx12 native path) for every call it cannot;
-#:   * `=0/false/no/off`          -> OFF, non-strict: the fp8 behaviour, bit for bit;
-#:   * `=1/true/yes/on`           -> ON and strict: a call int8 cannot serve raises instead of falling
-#:     back. This is the only mode in which a refusal is an error.
-#:
-#: D=128 only, fp16 only. Both objects were generated from the D=128 `attn_fp8qk_f16` (fp16 Q/O), so a
-#: `head_dim == 64` call is a clean refusal (`reason="int8_d128_only"`) and a bf16 call never reaches
-#: this path at all: bf16 takes precedence in the routing and is served by the
-#: `attn_fp8qk_bf16` / `attn_fp8qk_bf16_strided` pair. There is no int8 bf16 object.
+#: fp16 and D=128 only: a `head_dim == 64` call is refused (`reason="int8_d128_only"`), and a bf16
+#: call never reaches this path (bf16 takes precedence; there is no int8 bf16 object).
 SK1_HSACO_NAME_I8 = _with_suffix("attn_int8qk_f16.gfx1201.hsaco")
 SK1_HSACO_PATH_I8 = os.path.join(_HERE, SK1_HSACO_NAME_I8)
 SK1_SYMBOLS_I8 = ("attn_int8qk_f16_fwd", "attn_int8qk_f16_fwd_causal")
 SK1_HSACO_NAME_I8N = _with_suffix("attn_int8qk_f16_strided.gfx1201.hsaco")
 SK1_HSACO_PATH_I8N = os.path.join(_HERE, SK1_HSACO_NAME_I8N)
 SK1_SYMBOLS_I8N = ("attn_int8qk_f16_strided_fwd", "attn_int8qk_f16_strided_fwd_causal")
-#: The single default switch for int8, as `SK1_BF16_DEFAULT_ON` is for bf16. `SAGEATTN_SK1_INT8=0`
-#: restores the fp8 behaviour bit for bit.
 SK1_INT8_DEFAULT_ON = True
 
-#: `SAGEATTN_SK1_INT8`: `1/true/yes/on` -> ON and strict (a call the int8 path cannot serve raises);
-#: `0/false/no/off` -> OFF (the fp8 behaviour); unset -> `SK1_INT8_DEFAULT_ON`, non-strict. Read once,
-#: at import. `SAGEATTN_SK1_BACKEND=0` wins: no SK1 at all, int8 included.
 _sk1_i8_env = os.environ.get("SAGEATTN_SK1_INT8", "").strip().lower()
 if _sk1_i8_env in ("1", "true", "yes", "on"):
     SK1_INT8 = True
@@ -239,22 +176,12 @@ else:
     SK1_INT8 = bool(SK1_INT8_DEFAULT_ON)
     SK1_INT8_STRICT = False
 
-#: The bf16 objects. `attn_fp8qk_bf16` (contiguous HND, 12-argument, `__bf16` Q/O) and
-#: `attn_fp8qk_bf16_strided` (strided-HND / NHD, 18-argument). Both are the same kernel source as the
-#: fp16 pair, with the Q/O element type as a template parameter (`kernels/hip/attn_fp8qk_bf16.hip` /
-#: `kernels/hip/attn_fp8qk_bf16_strided.hip`).
-#: Each object also contains an inert `_Float16` instantiation (`attn_fp8qk_f16_*` /
-#: `attn_fp8qk_f16_strided_*`), kept so
-#: the fp16 code in the templated source can be compared instruction for instruction against the
-#: shipped fp16 object; it had no differing lines.
+#: The bf16 objects: the fp16 kernel source with the Q/O element type templated
+#: (`kernels/hip/attn_fp8qk_bf16.hip`, `attn_fp8qk_bf16_strided.hip`). The dtype contract is per
+#: object (`sk1_loader.Sk1Attn.qo_dtype`): fp16 objects refuse a bf16 Q and these refuse an fp16 one.
 #:
-#: The dtype contract is per object (`sk1_loader.Sk1Attn.qo_dtype`): the fp16 objects refuse a bf16 Q
-#: and these refuse an fp16 one.
-#:
-#: `SK1_BF16_DEFAULT_ON` is the single default switch and it is `True`: an unset `SAGEATTN_SK1_BF16`
-#: serves a bf16 call with the bf16 objects and falls back normally (fp8 SK1 first, then PR #368) for a
-#: call they cannot serve. `=1` forces ON and strict, `=0` forces OFF (a bf16 call then returns reason
-#: `"dtype"`).
+#: `SK1_BF16_DEFAULT_ON` is True: unset `SAGEATTN_SK1_BF16` serves bf16 calls with these objects
+#: and falls back normally. `=1` forces ON and strict, `=0` forces OFF (reason `"dtype"`).
 SK1_HSACO_NAME_B = _with_suffix("attn_fp8qk_bf16.gfx1201.hsaco")
 SK1_HSACO_PATH_B = os.path.join(_HERE, SK1_HSACO_NAME_B)
 SK1_SYMBOLS_B = ("attn_fp8qk_bf16_fwd", "attn_fp8qk_bf16_fwd_causal")
@@ -274,21 +201,14 @@ else:
     SK1_BF16 = bool(SK1_BF16_DEFAULT_ON)
     SK1_BF16_STRICT = False
 
-#: The arches a packaged code object exists for. The comparison is a prefix test, so a
-#: `gcnArchName` such as `gfx1201:sramecc-:xnack-` also matches.
-#:
-#: Membership means "an object set exists", not "this device is served". The serve decision is
-#: `selected_arch()`: a gfx1200 device is served only when `SAGEATTN_SK1_GFX1200` is set, so with the
-#: switch unset it takes the arch refusal (`reason="arch"`) with one log line naming the switch.
+#: The arches a packaged code object exists for (prefix test, so `gfx1201:sramecc-:xnack-` matches).
+#: Membership means "an object set exists", not "this device is served"; that is `selected_arch()`.
 SUPPORTED_ARCHS = ("gfx1201", "gfx1200")
 
-#: The exact envelope `try_sk1_t1` serves.  Anything else returns `None` (caller falls back).
-#: `layout` is HND or NHD, and `contiguous` means "contiguous in its own layout, or a physically-NHD
-#: view" (`sk1_loader._strided_triple`). Contiguous HND is served by `attn_fp8qk_f16`; everything else by
-#: `attn_fp8qk_f16_strided`. `dtype` is fp16 or bf16; a bf16 call is served by the `attn_fp8qk_bf16` /
-#: `attn_fp8qk_bf16_strided` pair (the fp16 sources with the Q/O type templated) when `SK1_BF16` allows
-#: it, and otherwise falls back with reason `"dtype"`. `head_dim` 64 is inside the envelope, but no D=64
-#: object is shipped, so those calls fall back.
+#: The exact envelope `try_sk1_t1` serves; anything else returns `None` (caller falls back).
+#: `contiguous` means "contiguous in its own layout, or a physically-NHD view"
+#: (`sk1_loader._strided_triple`). A bf16 call needs `SK1_BF16`, else it falls back with reason
+#: `"dtype"`. `head_dim` 64 is inside the envelope but no D=64 object is shipped, so it falls back.
 ENVELOPE = dict(
     layout=("HND", "NHD"),
     dtype=("fp16", "bf16"),
@@ -311,15 +231,13 @@ _BACKEND_I8 = None
 _BACKEND_I8_FAILED = None
 _BACKEND_I8N = None
 _BACKEND_I8N_FAILED = None
-#: The bf16 pair.
 _BACKEND_B = None
 _BACKEND_B_FAILED = None
 _BACKEND_BN = None
 _BACKEND_BN_FAILED = None
 _LOGGED = False
-#: `sk1_loader.strided_view_reason`, resolved once on first use. The stride guard is on the hot path
-#: of every call (`_envelope_ok` runs three times per attention call) and the non-kernel part of the
-#: path measures about 0.20 ms per call, so the import is cached rather than repeated.
+#: `sk1_loader.strided_view_reason`, imported once on first use: `_envelope_ok` runs the guard three
+#: times per attention call, so the import stays off the hot path.
 _SVR = None
 
 
@@ -333,7 +251,7 @@ def _strided_reason(t, name):
 
 
 def device_arch(device=None) -> str:
-    """The device's `gcnArchName` (prefix before `:`), or `""` if it cannot be read.  Never raises.
+    """The device's `gcnArchName` (prefix before `:`), or `""` if it cannot be read. Never raises.
 
     A named function so a test can monkeypatch the arch query without touching the routing logic.
     """
@@ -355,13 +273,8 @@ def device_arch(device=None) -> str:
 def arch_supported(device=None) -> bool:
     """True iff `device` may be served by a packaged code object right now.
 
-    This is `selected_arch(device) is not None`: membership in `SUPPORTED_ARCHS` and the gfx1200
-    switch. A gfx1200 device with `SAGEATTN_SK1_GFX1200` unset is therefore unsupported.
-
-    The module attribute is consulted through `globals()` so that a test which replaces this function
-    (for example with `lambda *a, **kw: False`, to simulate another device) is honoured; a plain call
-    would bypass the patch. A replacement that is not a plain function (such as the `MagicMock`
-    that `unittest.mock.patch` injects) is called as the patched callable.
+    This is `selected_arch(device) is not None`. The module attribute is consulted through
+    `globals()` so a test that replaces this function (even with a `MagicMock`) is honoured.
     """
     import types
     cur = globals().get("arch_supported")
@@ -380,7 +293,7 @@ def _arch_refusal_reason(device=None) -> str:
 
 
 def _log_once(reason: str) -> None:
-    """At most ONE short line per process, and never an exception out of the logging itself."""
+    """At most one short line per process, and never an exception out of the logging itself."""
     global _LOGGED
     if _LOGGED:
         return
@@ -395,15 +308,9 @@ def _log_once(reason: str) -> None:
 
 # ---- the HIP KV prologue router ------------------------------------------------------------------
 #: `SAGEATTN_SK1_PROLOGUE` picks the prologue that runs before the attention object: `triton` (the
-#: shipped `quant_kv_v8t*` kernels) or `hip` (`kernels/hip/kv_prologue.hip`, built to
-#: `kv_prologue.gfx1201.hsaco`, loaded and launched through `sk1_loader.HipRuntime`). Read once, at
-#: import. Unset -> `SK1_PROLOGUE_DEFAULT`.
-#:
-#: The default is `"hip"`, so the default D=128 path compiles and launches no Triton kernels.
-#: `SAGEATTN_SK1_PROLOGUE=triton` restores the Triton prologue exactly; any other value logs nothing
-#: and means the default. A call the HIP prologue cannot serve falls back to the Triton prologue
-#: normally, never to the gfx12 native path, and only the prologue moves: the attention objects and
-#: their launch are untouched.
+#: shipped `quant_kv_v8t*` kernels) or `hip` (`kernels/hip/kv_prologue.hip`, loaded through
+#: `sk1_loader.HipRuntime`). The default is `"hip"`; any other value means the default. A call the
+#: HIP prologue cannot serve falls back to the Triton prologue, never to the gfx12 native path.
 SK1_PROLOGUE_DEFAULT = "hip"
 _sk1_prol_env = os.environ.get("SAGEATTN_SK1_PROLOGUE", "").strip().lower()
 if _sk1_prol_env in ("hip", "triton"):
@@ -413,14 +320,14 @@ else:
 
 _HIP_P = None
 _HIP_P_TRIED = False
-#: the arch the loaded prologue was built for (see `_hip_prologue`)
+#: the arch the loaded prologue was built for
 _HIP_P_ARCH = None
 _PROLOGUE_LOGGED = 0
 
 
 def _log_prologue(msg: str) -> None:
-    """The prologue's own at-most-8-lines logger. Deliberately not `_log_once`, which owns the one
-    "SK1 backend not used" line and must stay available for a genuine fallback."""
+    """The prologue's own at-most-8-lines logger; not `_log_once`, which owns the "SK1 backend not
+    used" line."""
     global _PROLOGUE_LOGGED
     if _PROLOGUE_LOGGED >= 8:
         return
@@ -435,9 +342,7 @@ def _log_prologue(msg: str) -> None:
 def _hip_prologue(arch=None):
     """The loaded HIP prologue object, or `None`. Loaded once per process; never raises.
 
-    The prologue is a code object too, so it is per-arch: `kv_prologue.gfx1201.hsaco` /
-    `kv_prologue.gfx1200.hsaco`. `arch` selects it (default: this device's set, `_arch_now()`), and
-    the loaded instance is keyed on it like every `_load_*`, so a gfx1201 prologue can never serve a
+    Per-arch like every `_load_*` (default: `_arch_now()`), so a gfx1201 prologue can never serve a
     gfx1200 call.
     """
     global _HIP_P, _HIP_P_TRIED, _HIP_P_ARCH
@@ -459,20 +364,15 @@ def _hip_prologue(arch=None):
 
 
 def packaged_hsaco_path(arch=None) -> str:
-    """The object the packaged path loads: `attn_fp8qk_f16`.
-
-    `arch` selects the object set; it defaults to the device's set (`_arch_now()`), never to the
-    import-time switch value, so a gfx1200 name cannot appear on a gfx1201 device.
-    """
+    """The object the packaged path loads: `attn_fp8qk_f16`, for `arch` (default `_arch_now()`)."""
     return object_path(SK1_HSACO_PATH_S, arch or _arch_now())
 
 
 def gfx1200_status() -> dict:
-    """The state of the gfx1200 opt-in without loading anything and without a device. Never raises.
+    """The state of the gfx1200 opt-in without loading anything or needing a device. Never raises.
 
-    `{"switch": SAGEATTN_SK1_GFX1200, "default_on": False, "archs": ("gfx1200",),
-      "supported_archs": (...), "objects": {name: {"file", "present", "sha256", "size"}},
-      "gfx1201_objects": {...}}`.
+    Keys: `switch`, `default_on`, `archs`, `supported_archs`, `objects` and `gfx1201_objects`
+    (`{name: {"file", "present", "sha256", "size"}}`).
     """
     def one(path):
         out = dict(file=os.path.basename(path), path=path.replace("\\", "/"),
@@ -502,17 +402,11 @@ def gfx1200_status() -> dict:
 def fold_v_scale(sv):
     """Stage `SV' = SV / S` on the device and return `S` (B*H,) fp32.
 
-    `S = clamp_min(max_j sv(j), 1)` where `sv(j) = max(amax_v(j), 1)/448`, so `S > 1` exactly when
-    some key row has `amax_v > 448`.  The kernel's P fold is `p8 = e4m3(p * sv * 448)`, i.e.
-    `e4m3(p * amax_v)` with `p <= 1` and no clamp, so an `amax_v > 448` overflows e4m3 and the output
-    goes non-finite; staging `sv/S` makes the fold's argument `amax_v/S <= 448` for every key, and
-    the kernel's epilogue carries the compensating `x S`.
-
-    Three device ops on a `(B*H, N_pad)` fp32 tensor: an `amax` reduction, a `clamp_min`, and an
-    in-place divide. There is no `.item()`, host sync or CPU round-trip.
-
-    `S == 1.0` exactly whenever every `amax_v <= 448`, and `fl(sv/1.0f) == sv` bit-for-bit, so in
-    that case `sv` is unchanged and the kernel is bit-identical to the kernel without `S`.
+    `S = clamp_min(max_j sv(j), 1)`, so `S > 1` exactly when some key row has `amax_v > 448`. The
+    kernel's P fold is `e4m3(p * amax_v)` with no clamp, so that would overflow e4m3 and make the
+    output non-finite; dividing `sv` by `S` keeps the fold's argument `<= 448` and the kernel's
+    epilogue multiplies by `S` again. Three device ops, no host sync. When every `amax_v <= 448`,
+    `S == 1.0` and `sv` is bit-for-bit unchanged.
     """
     import torch
     s = sv.amax(dim=1).clamp_min(1.0)
@@ -521,7 +415,7 @@ def fold_v_scale(sv):
 
 
 def available() -> bool:
-    """True iff the prebuilt object exists and a HIP runtime can be resolved.  Never raises."""
+    """True iff the prebuilt object exists and a HIP runtime can be resolved. Never raises."""
     global _BACKEND, _BACKEND_FAILED
     if _BACKEND is not None:
         return True
@@ -538,16 +432,13 @@ def available() -> bool:
     return True
 
 
-#: The arch the currently cached objects were loaded for. A cache built for one arch must never
-#: serve a call routed for the other, so every `_load_*` is keyed on it and a mismatch drops the
-#: caches. On a real device the arch is constant for the process, so this costs one comparison.
+#: The arch the cached objects were loaded for. A cache built for one arch must never serve a call
+#: routed for the other, so every `_load_*` is keyed on it and a mismatch drops the caches.
 _ARCH_LOADED = None
 
-#: Every loader cache and its "already failed" flag. An arch change must drop all of them, not just
-#: the one being loaded: a call can load the int8 object and then fall through to the fp8 object, so
-#: dropping only `_BACKEND` would leave `_BACKEND_I8` holding a module built for the previous arch.
-#: That cannot happen on a real device, where the arch never changes, but it can when the arch probe
-#: is monkeypatched.
+#: Every loader cache and its "already failed" flag. An arch change must drop all of them: a call
+#: can load the int8 object and then fall through to the fp8 one, so dropping only `_BACKEND` would
+#: leave a module built for the previous arch (only possible when the arch probe is monkeypatched).
 _ARCH_CACHES = (
     "_BACKEND", "_BACKEND_FAILED",
     "_BACKEND_N", "_BACKEND_N_FAILED",
@@ -561,10 +452,8 @@ _ARCH_CACHES = (
 def _cache_arch(arch, cache_name, failed_name):
     """Drop every loader cache if it was built for a different arch, and record the arch.
 
-    This completes the loader's per-arch containment: even if a caller monkeypatches the arch probe
-    between calls, no loader can hand back an object whose file name carries the other arch's
-    suffix. The HIP prologue cache is keyed on its own `_HIP_P_ARCH` and drops itself, but it is
-    reset here too so the two cannot disagree.
+    The HIP prologue cache also drops itself via `_HIP_P_ARCH`; it is reset here too so the two
+    cannot disagree.
     """
     global _ARCH_LOADED, _HIP_P, _HIP_P_TRIED, _HIP_P_ARCH
     if _ARCH_LOADED != arch:
@@ -595,11 +484,8 @@ def _load(arch=None):
 def _load_n(arch=None):
     """The widened object `attn_fp8qk_f16_strided`, or `None` if it is not installed or will not load.
 
-    A missing widened object is a clean refusal
-    (`reason="no_strided_object"`), never a raise on the default path.
-
-    `arch` selects the object set; it defaults to this device's set (`_arch_now()`), never to the
-    import-time switch value, so the object set always follows the device.
+    A missing object is a clean refusal (`reason="no_strided_object"`), never a raise on the default
+    path. `arch` defaults to this device's set (`_arch_now()`).
     """
     global _BACKEND_N, _BACKEND_N_FAILED
     arch = _cache_arch(arch or _arch_now(), "_BACKEND_N", "_BACKEND_N_FAILED")
@@ -624,10 +510,7 @@ def _load_n(arch=None):
 def _load_i8(arch=None):
     """The contiguous-HND INT8 object `attn_int8qk_f16`, or `None` if it is not installed or will not load.
 
-    Same shape as `_load_n()`: a missing object is a clean refusal (`reason="no_int8_object"`), never
-    a raise on the default path.
-
-    `arch` selects the object set (default: the device's).
+    A missing object is a clean refusal (`reason="no_int8_object"`), never a raise on the default path.
     """
     global _BACKEND_I8, _BACKEND_I8_FAILED
     arch = _cache_arch(arch or _arch_now(), "_BACKEND_I8", "_BACKEND_I8_FAILED")
@@ -671,11 +554,10 @@ def _load_i8n(arch=None):
 
 
 def int8_status() -> dict:
-    """The state of the two int8 objects without loading anything.  Never raises.
+    """The state of the two int8 objects without loading anything. Never raises.
 
-    `{"enabled": SK1_INT8, "strict": SK1_INT8_STRICT, "contig": {...}, "strided": {...}}` where each
-    inner dict has `file`, `present`, `sha256`, `size`, `loaded`, `failed`.  Useful for recording which
-    object served a run.
+    Keys: `enabled`, `strict`, `default_on`, and `contig` / `strided` dicts with `file`, `present`,
+    `sha256`, `size`, `loaded`, `failed`.
     """
     def one(path, name, loaded, failed):
         out = dict(file=name, present=os.path.isfile(path), sha256=None, size=None,
@@ -725,11 +607,7 @@ def _load_b(arch=None):
 
 
 def _load_bn(arch=None):
-    """The bf16 object `attn_fp8qk_bf16_strided` (strided-HND / NHD, 18-argument), or `None`.
-
-    Bit-identical to `attn_fp8qk_bf16` on contiguous HND with `(rs,hs,bs) = (D, N*D, H*N*D)`; the
-    contiguous cell keeps the plain 12-argument object, exactly as the fp16 pair does.
-    """
+    """The bf16 object `attn_fp8qk_bf16_strided` (strided-HND / NHD, 18-argument), or `None`."""
     global _BACKEND_BN, _BACKEND_BN_FAILED
     arch = _cache_arch(arch or _arch_now(), "_BACKEND_BN", "_BACKEND_BN_FAILED")
     if _BACKEND_BN is not None:
@@ -752,11 +630,9 @@ def _load_bn(arch=None):
 
 
 def bf16_status() -> dict:
-    """The state of the two bf16 objects without loading anything.  Never raises.
+    """The state of the two bf16 objects without loading anything. Never raises.
 
-    `{"enabled": SK1_BF16, "strict": SK1_BF16_STRICT, "default_on": SK1_BF16_DEFAULT_ON,
-    "contig": {...}, "strided": {...}}`, each inner dict `file`, `present`, `sha256`, `size`,
-    `loaded`, `failed`.  Useful for recording which object served a run.
+    Same keys as `int8_status()`.
     """
     def one(path, name, loaded, failed):
         out = dict(file=name, present=os.path.isfile(path), sha256=None, size=None,
@@ -794,44 +670,33 @@ def _envelope_ok(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, smooth
         return "device"
     if q.device != k.device or q.device != v.device:
         return "device"
-    # The accepted dtypes are fp16 and bf16, and they must agree across q/k/v. The two have the same
-    # 16-bit width but different exponent/mantissa splits, so a mixed triple would be read with the
-    # wrong interpretation. This is a hard contract, not a switch.
+    # fp16 and bf16 are both 16 bits wide, so a mixed q/k/v triple would be silently misread
     if not (q.dtype == k.dtype == v.dtype):
         return "dtype"
     if q.dtype not in (torch.float16, torch.bfloat16):
         return "dtype"
     if not (q.dim() == 4 and k.dim() == 4 and v.dim() == 4):
         return "rank"
-    # Normalise to the (B, H, N, D) reading the kernel uses, then check the stride pattern. Requiring
-    # `is_contiguous()` would refuse the two layouts ComfyUI actually passes: an HND view made with
-    # `rearrange` and NHD `(B, N, H, D)`. Both are physically NHD, so the accepted set is "contiguous
-    # in its own layout, or a physically-NHD view", which is exactly the two patterns of
-    # `_strided_triple`. An arbitrary stride set is still refused (it could alias, and the launch is raw).
     if tensor_layout == "NHD":
         qq, kk, vv = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     else:
         qq, kk, vv = q, k, v
-    # Normalise to the (B, H, N, D) reading the kernel uses, then apply the stride rule.  The rule
-    # lives in one place -- `sk1_loader.strided_view_reason` -- so this envelope can never accept a
-    # pattern the loader's own contract check would refuse, or the reverse.  Contiguous HND still
-    # satisfies it trivially and still takes the unchanged object and code path below.
+    # The stride rule lives in `sk1_loader.strided_view_reason`, so this envelope can never accept a
+    # pattern the loader's own contract check would refuse.
     for nm, t in (("q", qq), ("k", kk), ("v", vv)):
         r = _strided_reason(t, nm)
         if r is not None:
             return r
     q, k, v = qq, kk, vv
-    # head_dim is 64 or 128, and the three tensors must agree on it (`q.size(3)` alone would let a D=64
-    # q against a D=128 k reach the raw launch). `try_sk1_t1` picks the object from this same value.
+    # the three tensors must agree on head_dim, or a D=64 q against a D=128 k would reach the raw launch
     if q.size(3) not in (64, 128) or k.size(3) != q.size(3) or v.size(3) != q.size(3):
         return "head_dim"
     if q.size(0) != k.size(0) or q.size(0) != v.size(0):
         return "batch"
     if q.size(1) != k.size(1) or q.size(1) != v.size(1):
         return "heads"
-    # q_len must equal k_len. The kernel takes a single `N` from `q` and pads K/V to `ceil(N/64)*64`,
-    # so a longer K would be silently truncated (the fused prologue reads only `n_pad` rows) and a
-    # shorter K would read out of bounds.
+    # the kernel takes a single `N` from `q`: a longer K would be silently truncated and a shorter
+    # K would read out of bounds
     if q.size(2) != k.size(2):
         return "seq_len"
     if k.size(2) != v.size(2):
@@ -848,38 +713,28 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
     Returns `(out, reason)` where `out` is the attention output in the caller's (B,H,N,D) shape, or
     `(None, reason)` when the call is not served and the caller must fall back to the shipped path.
 
-    `strict=False` (the default): a non-`gfx1201` arch, an unresolvable HIP
-    runtime, a code object that will not load, a failure inside the fused prologue, or a launch
-    failure **falls back** with at most one short log line per process and **never raises**.
-    `strict=True` (`SAGEATTN_SK1_BACKEND=1`, or `sk1_backend=True`): the same failures **raise**,
-    because silently falling back on a kernel that was explicitly demanded would hide a defect.
+    `strict=False` (the default): an unsupported arch, an unresolvable HIP runtime, a code object
+    that will not load, a prologue failure or a launch failure falls back with at most one short log
+    line per process and never raises. `strict=True` (`SAGEATTN_SK1_BACKEND=1`, or
+    `sk1_backend=True`): the same failures raise, since silently falling back on an explicitly
+    demanded kernel would hide a defect.
 
-    `int8=None` reads the module constant `SK1_INT8` (`SAGEATTN_SK1_INT8`; `SK1_INT8_DEFAULT_ON` is
-    the default switch and is `True`); `int8=True/False` forces it for this call.  With `int8` on, the
-    two int8 objects serve the call (`attn_int8qk_f16` for contiguous HND, `attn_int8qk_f16_strided` for strided-HND/NHD).
+    `int8=None` reads `SK1_INT8` (`SAGEATTN_SK1_INT8`); `True/False` forces it for this call. The int8
+    objects are fp16, head_dim 128 only, so when not strict a call they cannot serve falls back to
+    the fp8 objects, and if those cannot serve it either this returns `(None, <the fp8 route's own
+    reason>)`, never an int8-specific one. `int8=True` is strict for the int8 path: the same call
+    raises. A bf16 call never reaches the int8 path.
 
-    The int8 objects are fp16-Q/O and head_dim 128 only, so with `int8` on and not strict (the
-    default) a call they cannot serve falls back normally: first to the fp8 SK1 objects, and if those
-    cannot serve it either, this function returns `(None, <the fp8 route's own reason>)` and the
-    caller continues to its PR #368 path.  That reason is the fp8 route's (`"no_d64_object"` for
-    `head_dim == 64`, `"seq_len"`/`"dtype"`/... for an envelope miss), never an int8-specific string.
-    A bf16 call never reaches the int8 path at all: bf16 takes precedence and is served by the
-    `attn_fp8qk_bf16`/`attn_fp8qk_bf16_strided` pair.  `int8=True` (i.e. `SAGEATTN_SK1_INT8=1`, or `sk1_int8=True`) is
-    strict for the int8 path: the same call raises.
-
-    `bf16=None` reads the module constant `SK1_BF16` (`SAGEATTN_SK1_BF16`; `SK1_BF16_DEFAULT_ON` is
-    the default switch); `bf16=True/False` forces it for this call.  A bf16 call with the bf16 objects
-    switched off is a clean refusal `reason="dtype"`.  `head_dim == 64` is a clean refusal
-    `bf16_d128_only` (both bf16 objects are D=128, like the int8 pair).
+    `bf16=None` reads `SK1_BF16` (`SAGEATTN_SK1_BF16`); `True/False` forces it for this call. A bf16
+    call with the bf16 objects off is refused with `reason="dtype"`; `head_dim == 64` is refused
+    with `bf16_d128_only`.
     """
     reason = _envelope_ok(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, smooth_k,
                           smooth_v, attn_mask)
     if reason is not None:
         return None, reason
-    # The arch check is the one place the arch/switch decision is made. `arch_supported(q.device)` is
-    # called explicitly, as a module-attribute call, so a test that replaces that function to
-    # simulate another device is honoured; reading `selected_arch()` alone would ignore it.
-    # `arch_supported` is `selected_arch(...) is not None` unless it has been replaced.
+    # `arch_supported` is called as a module attribute so a test that replaces it to simulate another
+    # device is honoured; `selected_arch()` alone would ignore it.
     if not arch_supported(q.device):
         if strict:
             raise RuntimeError(
@@ -889,22 +744,19 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 % (device_arch(q.device) or "<unknown>", ", ".join(SUPPORTED_ARCHS)))
         _log_once(_arch_refusal_reason(q.device))
         return None, "arch"
-    # The object set this call uses, derived from the same decision the check above approved, so a
-    # gfx1200 object is never loaded on gfx1201 (or the reverse): the name carries the arch.
+    # the object set this call uses, derived from the decision the check above approved
     _arch = selected_arch(q.device) or _DEFAULT_ARCH
-    # Routing. Contiguous HND (all three tensors) goes to `attn_fp8qk_f16` on the plain path below.
-    # Everything else (strided HND, NHD) goes to the widened `attn_fp8qk_f16_strided`.
+    # Routing: contiguous HND (all three tensors) goes to `attn_fp8qk_f16`; everything else to the
+    # strided object.
     if tensor_layout == "NHD":
         qq, kk, vv = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     else:
         qq, kk, vv = q, k, v
     contiguous_hnd = bool(tensor_layout == "HND" and q.is_contiguous() and k.is_contiguous()
                           and v.is_contiguous())
-    # No object serves head_dim 64, so every D=64 call falls through to the shipped path.
     d64 = int(qq.size(3)) == 64
-    # The dtype decides. bf16 has its own object pair (the int8 and fp16 pairs are fp16 Q/O only), so
-    # bf16 takes precedence over int8. `SK1_BF16` is the switch; with it off a bf16 call returns
-    # `"dtype"`.
+    # bf16 has its own object pair (the int8 and fp16 pairs are fp16 only), so it takes precedence
+    # over int8; with `SK1_BF16` off a bf16 call returns `"dtype"`
     import torch
     is_bf16 = bool(q.dtype == torch.bfloat16)
     if bf16 is None:
@@ -919,29 +771,20 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
         _log_once("bf16 input but the bf16 objects are switched off")
         return None, "dtype"
     if is_bf16 and d64:
-        # The bf16 objects are D=128 only: serving a D=64 call with one would read the wrong KSTRIDE.
-        # Clean refusal, the same shape as the int8 one below.
+        # a D=64 call on a D=128 object would read the wrong KSTRIDE
         if b_strict or strict:
             raise RuntimeError(
                 "the bf16 SK1 objects (%s / %s) are head_dim 128 only; head_dim is 64"
                 % (SK1_HSACO_NAME_B, SK1_HSACO_NAME_BN))
         _log_once("bf16 object is head_dim 128 only (head_dim=64)")
         return None, "bf16_d128_only"
-    # The int8 objects, only when the switch says so.
     if int8 is None:
         want_i8, i8_strict = bool(SK1_INT8), bool(SK1_INT8_STRICT)
     else:
         want_i8, i8_strict = bool(int8), bool(int8)
 
-    # The normal fallback. The int8 objects are D=128 / fp16 only. With `int8` on but not strict (the
-    # default, `SAGEATTN_SK1_INT8` unset), a call the int8 path cannot serve falls back first to the
-    # fp8 SK1 objects if they can serve it, else to the caller's PR #368 path. `_i8_fallback` is that
-    # first step: it re-enters this function with `int8=False` and returns that call's
-    # `(out, reason)` as is, so a D != 128 call comes back with `"no_d64_object"`, not an
-    # int8-specific string. `int8=False` cannot re-enter this branch, so the recursion is one level
-    # deep.
-    #
-    # `strict` never reaches here: every refusal below raises first when `strict` is set.
+    # Re-enters this function with `int8=False` and returns that call's `(out, reason)` as is, so
+    # the recursion is one level deep. `strict` never reaches it: every refusal raises first.
     def _i8_fallback():
         return try_sk1_t1(q, k, v, tensor_layout=tensor_layout, is_causal=is_causal,
                           sm_scale=sm_scale, return_lse=return_lse, smooth_k=smooth_k,
@@ -949,8 +792,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                           bf16=bf16)
 
     if want_i8 and d64 and not is_bf16:
-        # Both int8 objects were generated from the D=128 `attn_fp8qk_f16`; serving a D=64 call with one
-        # would read the wrong KSTRIDE. Clean refusal, same shape as every other envelope miss.
+        # a D=64 call on a D=128 object would read the wrong KSTRIDE
         if i8_strict or strict:
             raise RuntimeError(
                 "the int8 SK1 objects (%s / %s) are head_dim 128 only; head_dim is 64"
@@ -963,7 +805,6 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
         _log_once("no head_dim-64 object is shipped")
         return None, "no_d64_object"
     try:
-        # Every loader is keyed on the arch the check above approved.
         if is_bf16:
             attn = _load_b(_arch) if contiguous_hnd else _load_bn(_arch)
         elif want_i8:
@@ -972,8 +813,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
             attn = _load(_arch) if contiguous_hnd else _load_n(_arch)
     except Exception as e:
         if strict or (want_i8 and not is_bf16 and i8_strict):
-            # `int8=True` is strict for the int8 path: a load failure of an explicitly demanded int8
-            # object raises rather than silently serving fp8.
+            # an explicitly demanded int8 object must not silently serve fp8
             raise
         if want_i8 and not is_bf16:
             _log_once("int8 load failed, falling back to the fp8 SK1 objects: %s" % e)
@@ -1000,28 +840,22 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                                % (SK1_HSACO_NAME_N, _BACKEND_N_FAILED))
         _log_once("widened object unavailable: %s" % _BACKEND_N_FAILED)
         return None, "no_strided_object"
-    # Everything below can fail for reasons that have nothing to do with the code object: a broken
-    # `quant_kv_v8t` module (a partial install), an unsupported platform inside the Triton prologue, or
-    # an allocation failure. The default path must therefore stay raise-free all the way to the launch.
-    # The Triton prologue modules are imported only where they are the fallback: importing Triton
-    # costs ~0.3 s on the first call where `rocm-sdk` is on PATH (its AMD backend shells out to it).
+    # Everything below can fail for reasons unrelated to the code object (a partial install, an
+    # allocation failure), and the default path must stay raise-free up to the launch. The Triton
+    # prologue modules are imported only where they are the fallback: importing Triton costs ~0.3 s
+    # on the first call.
     try:
         import torch
         B, H, N, D = qq.shape
         sm = float(sm_scale if sm_scale is not None else D ** -0.5)
         n_pad = (N + 63) // 64 * 64
         BH = B * H
-        hp = _hip_prologue(_arch)   # `None` unless SAGEATTN_SK1_PROLOGUE=hip and it loaded
+        hp = _hip_prologue(_arch)   # `None` unless the HIP prologue is selected and loaded
         if is_bf16:
-            # The same fused K/V kernels, called with bf16 tensors. Every `tl.load` in
-            # `quant_kv_v8t`/`quant_triton` is followed by `.to(tl.float32)` and a bf16 -> fp32
-            # widening is exact for every bit pattern, so the fp8 bytes and the fp32 scales are what
-            # the fp16 path produces for the same values. The contiguous path skips the discarded
-            # `quant_rows_fp8(q)`; the strided path reuses the K/V-only prologue as is. `out` is bf16,
-            # the kernel's own O type.
+            # The Triton K/V kernels widen every load to fp32 (exact for bf16), so they serve bf16
+            # as is. `out` is bf16, the kernel's own O type.
             if contiguous_hnd:
                 qr = q.reshape(BH, N, D).contiguous()
-                # The HIP prologue first; the Triton call is the fallback.
                 res = (hp.quant_kv(k, v, n_pad=n_pad, smooth_k=bool(smooth_k), int8=False)
                        if hp is not None else None)
                 if res is None:
@@ -1042,10 +876,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 else:
                     out = torch.empty(BH, N, D, device=q.device, dtype=q.dtype)
         elif want_i8:
-            # K -> int8 (scale amax/127, round-to-nearest-even, clamp), V -> fp8 e4m3. Same pad
-            # contract, same `S` staging, same launch below. The strided module also serves
-            # contiguous HND (it is the 18-argument form) but the contiguous-HND cell keeps the plain
-            # 12-argument object, exactly as the fp8 pair does.
+            # K -> int8 (scale amax/127, round-to-nearest-even, clamp), V -> fp8 e4m3
             if contiguous_hnd:
                 qr = q.reshape(BH, N, D).contiguous()
                 res = (hp.quant_kv(k, v, n_pad=n_pad, smooth_k=bool(smooth_k), int8=True)
@@ -1080,8 +911,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 k8, sk, v8t, sv = res
             out = torch.empty(BH, N, D, device=q.device, dtype=torch.float16)
         else:
-            # The widened prologue reads K/V straight out of the strided view (no copy) and skips
-            # quantising Q, whose int8 result and scales the SK1 kernel would discard anyway.
+            # reads K/V straight out of the strided view (no copy); Q is not quantised
             res = (hp.quant_kv(kk, vv, n_pad=n_pad, smooth_k=bool(smooth_k), int8=False)
                    if hp is not None else None)
             if res is None:
@@ -1093,9 +923,6 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 out = torch.empty(B, N, H, D, device=q.device, dtype=torch.float16)
             else:
                 out = torch.empty(BH, N, D, device=q.device, dtype=torch.float16)
-        # Only the 12-argument objects want `S`. When they do, this stages `SV' = SV/S` and returns S
-        # for the kernel's epilogue. For every input with |V| <= 448, S == 1.0 and `sv` comes out
-        # bit-for-bit unchanged.
         sv_s = fold_v_scale(sv) if attn.with_s else None
     except Exception as e:                                          # noqa: BLE001
         if strict or (want_i8 and not is_bf16 and i8_strict):
@@ -1110,8 +937,7 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
         if contiguous_hnd:
             attn.launch(qr, k8, sk, v8t, sv, None, out, H, N, n_pad, sm, bool(is_causal), s=sv_s)
         else:
-            # the widened kernel is addressed in the logical (B, H, N, D) reading of the caller's
-            # tensor: for NHD that is the transpose view; `out` is written with the same pattern.
+            # addressed in the logical (B, H, N, D) reading; for NHD that is the transpose view
             attn.launch_strided(qq, k8, sk, v8t, sv, None,
                                 out.view(B, H, N, D) if tensor_layout == "HND"
                                 else out.transpose(1, 2),
@@ -1120,7 +946,6 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
         if strict or (want_i8 and not is_bf16 and i8_strict):
             raise
         if want_i8 and not is_bf16:
-            # Likewise for a failed int8 launch.
             _log_once("int8 launch failed, falling back to the fp8 SK1 objects: %s" % e)
             return _i8_fallback()
         _log_once("launch failed: %s" % e)

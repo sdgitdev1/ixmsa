@@ -1,30 +1,23 @@
 """The HIP KV prologue: a ctypes-launched code object that replaces the Triton prologue on the
 default SK1 paths. Source: `kernels/hip/kv_prologue.hip`.
 
-A second code object, `h36_prologue_d64.gfx1201.hsaco`, covers `head_dim == 64`. It is loaded
-tolerantly and is not part of this package: when it is missing or will not load, D=64 calls refuse
-(`no_symbol_d64`) and the caller runs the Triton D=64 prologue, while the D=128 object is unaffected.
-D=64 is fp8 Q.K only. `int8=True` at D=64 refuses `int8_d64`, because the int8 Q.K objects are the
-D=128-only `attn_int8qk_f16` / `attn_int8qk_f16_strided` and no int8 D=64 attention object exists.
-
-It produces exactly the four tensors the SK1 attention objects consume, and nothing else:
+It produces the four tensors the SK1 attention objects consume:
 
     k8  (BH, n_pad, D)   int8 (int8 arm) or e4m3 (fp8 arm), contiguous
     sk  (BH, n_pad)      fp32
     v8t (BH, D, n_pad)   e4m3, contiguous, transposed
     sv  (BH, n_pad)      fp32
 
-`vmean` is not produced (the shipped path passes `None`) and `S` is still made by
-`fold_v_scale(sv)` in torch. No Q is read: the fp8-contiguous Triton prologue's `quant_rows_fp8(q)`
-result is discarded.
+Q is not read and `vmean` is not produced. At most two launches (`kseq_mean_*` only when
+`smooth_k`, then `quant_kv_*`). Addressing is 64-bit; `strided_view_reason` stays the acceptance
+rule, so the prologue serves exactly the views the rest of SK1 accepts.
 
-Two launches at most (`kseq_mean_*` only when `smooth_k`, then `quant_kv_*`), against 1-4
-Triton launches otherwise. All addressing inside the kernels is 64-bit, so the prologue itself has no
-2^31-element offset limit; `strided_view_reason` is still the acceptance rule, so the prologue serves
-exactly the views the rest of SK1 accepts.
+`head_dim == 64` uses a second code object, `h36_prologue_d64.gfx1201.hsaco`, loaded tolerantly and
+not part of this package: when it is missing or will not load, D=64 calls refuse (`no_symbol_d64`)
+and the caller runs the Triton D=64 prologue. D=64 is fp8 Q.K only; `int8=True` at D=64 refuses
+`int8_d64` because no int8 D=64 attention object exists.
 
-Loading and launching go through `sk1_loader.HipRuntime`, the same ctypes path the attention objects
-use, so there is no second runtime, and the launch always carries a contract check.
+Loading and launching go through `sk1_loader.HipRuntime`.
 """
 from __future__ import annotations
 
@@ -44,19 +37,14 @@ HSACO_PATH = os.path.join(HERE, HSACO_NAME)
 def hsaco_path_for(arch=None, name=None):
     """The D=128 prologue object for `arch` (`""` / `None` / `gfx1201` -> the gfx1201 object).
 
-    The prologue is a code object like the attention objects, so it is per-arch:
-    `kv_prologue.gfx1201.hsaco` / `kv_prologue.gfx1200.hsaco`. The symbols are identical (same
-    source, same commands, only `--offload-arch` differs), so only the path changes.
+    Per-arch (`kv_prologue.gfx1200.hsaco`); the symbols are identical, only the path changes.
     """
     base = name or HSACO_NAME
     if arch in (None, "", "gfx1201"):
         return os.path.join(HERE, base)
     return os.path.join(HERE, base.replace(".gfx1201.hsaco", ".%s.hsaco" % arch))
 
-#: The D=64 object is a separate code object, so the D=128 object and its sha256 are unaffected by
-#: it. It has no int8 K symbol on purpose: the int8 Q.K path is the D=128-only `attn_int8qk_f16` /
-#: `attn_int8qk_f16_strided` pair, so every D=64 call that reaches a prologue is fp8 Q.K (`check` refuses
-#: `int8=True` with `int8_d64`).
+#: Separate D=64 object; it has no int8 K symbol because the int8 Q.K path is D=128-only.
 HSACO_NAME_D64 = "h36_prologue_d64.gfx1201.hsaco"
 HSACO_PATH_D64 = os.path.join(HERE, HSACO_NAME_D64)
 
@@ -73,7 +61,6 @@ SYMBOLS = {
     ("bf16", "f8"): "quant_kv_bf16_f8",
 }
 MEAN_SYMBOLS = {"f16": "kseq_mean_f16", "bf16": "kseq_mean_bf16"}
-#: D=64 has no int8 K variant (there is no int8 D=64 attention object to feed)
 SYMBOLS_D64 = {
     ("f16", "f8"): "h36_quant_kv_f16_f8",
     ("bf16", "f8"): "h36_quant_kv_bf16_f8",
@@ -96,9 +83,8 @@ def n_pad_for(N: int) -> int:
 
 
 class HipPrologue:
-    """The loaded HIP prologue. One instance per process; `quant_kv` returns `None` (never raises)
-    when the call is outside the contract or when an allocation or launch fails, so the caller can
-    run the Triton prologue."""
+    """The loaded HIP prologue. `quant_kv` returns `None` (never raises) when the call is outside
+    the contract or an allocation or launch fails, so the caller can run the Triton prologue."""
 
     def __init__(self, hsaco_path=None, rt=None, hsaco_path_d64=None):
         self.path = hsaco_path or HSACO_PATH
@@ -109,8 +95,7 @@ class HipPrologue:
         self.mod = self.rt.load_module(self.path)
         self.fns = {k: self.rt.get_function(self.mod, s) for k, s in SYMBOLS.items()}
         self.means = {k: self.rt.get_function(self.mod, s) for k, s in MEAN_SYMBOLS.items()}
-        # The D=64 object is loaded tolerantly: a missing or unloadable one must not stop the D=128
-        # prologue, so it degrades to `no_symbol_d64` and the caller runs the Triton D=64 prologue.
+        # a missing or unloadable D=64 object must not stop the D=128 prologue
         self.path_d64 = hsaco_path_d64 or HSACO_PATH_D64
         self.fns64, self.means64, self.d64_error = {}, {}, None
         try:
@@ -127,8 +112,7 @@ class HipPrologue:
         self.n_mean_launches = 0
         self.n_kv_launches = 0
         self.refusal_reasons = collections.Counter()
-        #: HIP dereferences `kernelParams` asynchronously, and this object issues two launches per
-        #: call, so keep both argument blocks alive well past the launch (see `HipRuntime.launch`).
+        #: HIP dereferences `kernelParams` asynchronously: keep argument blocks alive past the launch.
         self._keep = collections.deque(maxlen=128)
 
     def describe(self):
@@ -143,11 +127,7 @@ class HipPrologue:
 
     # ------------------------------------------------------------------ the contract
     def check(self, k, v, n_pad, int8):
-        """`None` if this call is inside the prologue's contract, else a clean reason string.
-
-        `head_dim` is `{64, 128}`. D=64 is fp8 Q.K only (`int8_d64`) because there is no int8 D=64
-        attention object (see the module docstring).
-        """
+        """`None` if this call is inside the prologue's contract, else a reason string."""
         if not (k.is_cuda and v.is_cuda):
             return "not_cuda"
         if k.dim() != 4 or v.dim() != 4:
@@ -176,9 +156,7 @@ class HipPrologue:
             return "v_" + r
         N = int(k.shape[2])
         if N < 1:
-            # N=0 would pass the n_pad checks below, then the mean kernel would compute 0/0 and
-            # write NaN and the KV launch would get gridDim.x = 0. The served path already refuses
-            # N<1, so this only guards the direct API.
+            # N=0 would make the mean kernel compute 0/0 and the KV launch get gridDim.x = 0
             return "n_lt_1"
         if int(n_pad) < N or int(n_pad) % BN:
             return "n_pad"
@@ -188,15 +166,12 @@ class HipPrologue:
     def quant_kv(self, k, v, n_pad=None, smooth_k=False, int8=True, floor=1e-12):
         """`(k8, sk, v8t, sv)` for a logical `(B, H, N, D)` fp16/bf16 `k`/`v`, or `None` if refused.
 
-        `k`/`v` may be strided views (any pattern `strided_view_reason` accepts); the four outputs
-        are freshly allocated contiguous tensors, exactly as the Triton prologue returns them.
+        `k`/`v` may be strided views (any pattern `strided_view_reason` accepts); the outputs are
+        freshly allocated contiguous tensors. `floor` is the int8-K scale floor only; the fp8-K and
+        V scales use a hard-coded `1e-12`.
 
-        `floor` is the int8-K scale floor only, as in the Triton int8 prologue. The fp8-K scale and
-        V's scale use the hard-coded `1e-12` the Triton fp8 prologue uses and never `floor`.
-
-        Never raises. A failed launch or an allocation failure is caught and returned as the refusal
-        `"launch"`, so the caller runs the Triton prologue. Letting it propagate would surface as
-        `prologue_failed`, which routes to the gfx12 native path instead of the Triton prologue.
+        Never raises: a failed launch or allocation returns the refusal `"launch"` so the caller
+        runs the Triton prologue (a propagated error would route to the gfx12 native path instead).
         """
         if k.dim() != 4 or v.dim() != 4:
             return self._refuse("rank")
@@ -267,12 +242,7 @@ class HipPrologue:
     def kseq_mean(self, k):
         """The `smooth_k` sequence-axis mean `(B, H, D)` fp32, or `None` if refused.
 
-        Exposed separately so a test can compare it against an fp64 reference without going through
-        `quant_kv`. The summation is order-independent and deterministic: fp64 accumulation of
-        exactly-widened fp16/bf16 inputs, one fp32 rounding at the end. That is "fp64-accumulated",
-        not "exact" and not "correctly rounded": widening is exact, summing is not, and the `N*2^-53`
-        bound is relative to the sum of `|x|`, so it says nothing when terms cancel.
-
+        Deterministic: fp64 accumulation of widened fp16/bf16 inputs, one fp32 rounding at the end.
         Never raises: an allocation or launch failure returns the refusal `"mean_launch"`.
         """
         if k.dim() != 4 or not k.is_cuda or k.dtype not in (torch.float16, torch.bfloat16):
@@ -288,7 +258,7 @@ class HipPrologue:
         try:
             mean = torch.empty((B * H, D), dtype=torch.float32, device=k.device)
             self._launch_mean(k, mean, N, H)
-        except Exception:  # noqa: BLE001 - never raises, extended to the mean entry
+        except Exception:  # noqa: BLE001 - never raises
             return self._refuse("mean_launch")
         return mean.view(B, H, D)
 
