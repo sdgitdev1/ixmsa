@@ -1588,7 +1588,7 @@ Replacing the Triton quantization step with hand-written HIP, an independent rev
 
 **Result.** `SAGEATTN_CK=1` routes a call to comfy-kitchen when it is installed, the call is non-causal, head_dim is 128, no LSE is requested and no `sk1_backend=` is passed; its output then equals comfy-kitchen's bit for bit in both layouts. head_dim 64 stays on PR #368's path because there comfy-kitchen is more accurate but slower: its time over PR #368's is 1.10 / 1.55 / 1.02 at (H, N) = (10, 4096), (20, 1024), (10, 16384) in fp16, against relative RMS error 0.014 vs 0.037. comfy-kitchen has no causal mode. With the switch unset all 87 output cells are bit-identical to v0.4.0, and a missing comfy-kitchen gives a warning and the normal paths.
 
-**Status:** in v0.6.0, off by default.
+**Status:** removed before v0.6.0. Once the int8 P·V kernels were faster than comfy-kitchen (F174), the switch only duplicated ComfyUI's own `--use-ck-attention`.
 
 ### F172 — An 8-bit integer P·V, after comfy-kitchen <sub>(track H38; research)</sub>
 

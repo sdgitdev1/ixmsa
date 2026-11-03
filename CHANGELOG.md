@@ -24,9 +24,6 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
   `sageattn` does not use it.
 - `SAGEATTN_SK1_I8PV=0` (or `sageattn(..., sk1_i8pv=False)`) turns the new kernels off; `SAGEATTN_SK1_INT8=0` does too
   for fp16. head_dim 64, fewer than 129 tokens and `sm_scale <= 0` keep the previous objects.
-- **`SAGEATTN_CK=1`** hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it
-  is installed, for comparison (F167, F168). head_dim 64 stays on PR #368's path, where comfy-kitchen is more
-  accurate but slower (F171). Off by default.
 - The unshipped head_dim 64 prologue path and two unused helpers are gone; the loader closes the
   code object file after reading it.
 - `tools/gfx1200_probe.py` now shows the object the device would actually load (it always printed

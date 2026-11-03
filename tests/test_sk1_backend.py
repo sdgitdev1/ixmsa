@@ -244,33 +244,6 @@ def test_gfx1200_switch_does_nothing_on_this_card():
     assert on == _run_fresh(code, SAGEATTN_SK1_GFX1200="0")
 
 
-def test_ck_switch_routes_only_non_causal_d128_calls():
-    # SAGEATTN_CK=1 hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it is
-    # installed; head_dim 64 and causal calls stay on this package's paths, bit for bit.
-    pytest.importorskip("comfy_kitchen")
-    code = """
-        import hashlib, torch, comfy_kitchen
-        from sageattention import sageattn
-        h = lambda t: hashlib.sha256(t.float().cpu().numpy().tobytes()).hexdigest()
-        g = torch.Generator(device="cuda").manual_seed(0)
-        q, k, v = [torch.randn(1, 8, 512, 128, device="cuda", dtype=torch.float16, generator=g)
-                   for _ in range(3)]
-        ck = h(comfy_kitchen.int8_attention(q, k, v))
-        qn, kn, vn = (t.transpose(1, 2).contiguous() for t in (q, k, v))
-        hnd = h(sageattn(q, k, v, tensor_layout="HND"))
-        nhd = h(sageattn(qn, kn, vn, tensor_layout="NHD").transpose(1, 2))
-        causal = h(sageattn(q, k, v, tensor_layout="HND", is_causal=True))
-        q64, k64, v64 = [torch.randn(1, 8, 512, 64, device="cuda", dtype=torch.float16, generator=g)
-                         for _ in range(3)]
-        print("RESULT", hnd == ck, nhd == ck, causal, h(sageattn(q64, k64, v64, tensor_layout="HND")))
-    """
-    on = _run_fresh(code, SAGEATTN_CK="1")
-    off = _run_fresh(code, SAGEATTN_CK="0")
-    assert on[:2] == ["True", "True"]
-    assert off[:2] == ["False", "False"]
-    assert on[2:] == off[2:]
-
-
 def test_default_path_does_not_import_triton():
     # Importing Triton costs ~0.3 s where its AMD backend finds `rocm-sdk` on PATH, so the default
     # (HIP prologue) path must not import it at all.
@@ -284,7 +257,7 @@ def test_default_path_does_not_import_triton():
         torch.cuda.synchronize()
         print("RESULT", "triton" in sys.modules)
     """
-    assert _run_fresh(code, SAGEATTN_SK1_PROLOGUE="hip", SAGEATTN_CK="0") == ["False"]
+    assert _run_fresh(code, SAGEATTN_SK1_PROLOGUE="hip") == ["False"]
 
 
 # ---- the int8 Q.K + int8 P.V objects (attn_i8pv_*), served first for head_dim 128 ----

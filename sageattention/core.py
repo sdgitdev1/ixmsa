@@ -143,22 +143,6 @@ else:
     SK1_BACKEND = True          # DEFAULT: ON -- the p*amax_v overflow is fixed by attn_fp8qk_f16.
     SK1_BACKEND_STRICT = False  # ... with a silent fallback everywhere else.  =0 forces it OFF.
 
-#: `SAGEATTN_CK=1` serves non-causal head_dim 128 calls with comfy-kitchen's `int8_attention` when it
-#: is installed and reports itself available: on gfx1201 it measured faster and more accurate than
-#: this package's kernels there (F167, F168). At head_dim 64 it is more accurate but slower than the
-#: PR #368 path, so those calls, causal calls, `return_lse` and an explicit `sk1_backend=` keep the
-#: paths below. Off by default.
-CK_ATTENTION = None
-if os.environ.get("SAGEATTN_CK", "").strip().lower() in ("1", "true", "yes", "on"):
-    try:
-        import comfy_kitchen
-        if comfy_kitchen.int8_attention_is_available():
-            CK_ATTENTION = comfy_kitchen.int8_attention
-    except ImportError:
-        pass
-    if CK_ATTENTION is None:
-        warnings.warn("SAGEATTN_CK=1 but comfy-kitchen's int8 attention is not available; ignoring it.")
-
 #: INT8 Q.K objects, ON by default for fp16 with head_dim 128.
 #:
 #: Unset `SAGEATTN_SK1_INT8` routes the prebuilt SK1 path to the two int8 objects
@@ -1183,12 +1167,6 @@ def sageattn(
                 "Refusing to ignore it, because that would return silently wrong "
                 "output. Pass mask=None, or use a backend that supports masking."
             )
-        if (CK_ATTENTION is not None and q.shape[-1] == 128 and not is_causal and not return_lse
-                and sk1_backend is None):
-            if tensor_layout == "HND":
-                return CK_ATTENTION(q, k, v, scale=sm_scale)
-            return CK_ATTENTION(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
-                                scale=sm_scale).transpose(1, 2)
         fast_path_keys = {"value_dtype", "smooth_k", "qk_quant_gran", "pv_accum_dtype", "smooth_v"}
         # ------------------------------------------------------------------ prebuilt SK1
         # ON by default, and the packaged object is `attn_fp8qk_f16` (the p*amax_v fp8 overflow of
