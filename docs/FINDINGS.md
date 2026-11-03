@@ -1636,3 +1636,13 @@ End to end (Krea2 Turbo fp8_scaled, 1672×1256, 8 steps, v0.6 attention, the lay
 A review before release found three defects, each fixed with a test: the rescale pass put the rows on the grid's y axis, which stops at 65535, so from 65536 tokens (video models) the remaining rows were left unscaled (relative error 0.71 at 70000 rows, no error raised); a NaN in x came out as finite values, because `fminf` / `fmaxf` clamped it to −448; and an input that needs a gradient came back detached. Rows are now on x, the clamp keeps NaN, and calls autograd has to see through return `None`. The code object is also loaded per device rather than per architecture. The Krea2 latent is bit-identical before and after.
 
 **Status:** v0.6, `sageattention.fp8_linear` (object `fp8_rowquant`). A library function: `sageattn` does not call it.
+
+### F176 — Stock ComfyUI turns `smooth_k` off; v0.6 smooths K anyway <sub>(v0.6)</sub>
+
+**Question.** ComfyUI's `attention_sage` calls `sageattn(..., smooth_k=False)`. What does that cost on real activations, and what does smoothing cost in time?
+
+**Result.** On the 18 captures in fp16 the median error with smoothing off is 0.0086 against 0.0072 with it on, but the layers with extreme keys break: Krea2 block 0 at 0.195 / 0.349 / 0.360 against 0.0084 / 0.0085 / 0.0145 (up to 41× worse), and its 1056-token capture at 0.259 against 0.0117. PR #368's path with smoothing off is as bad there (0.217 / 0.366 / 0.370 and 0.253); comfy-kitchen, which subtracts a key mean itself, scores 0.026 / 0.0097 / 0.051. In bf16 the median moves from 0.0100 to 0.0103. Smoothing costs 1.0 / 0.6 / 0.1 % of the call at N = 4096 / 8771 / 16384, now that the K mean comes from sampled rows (F174).
+
+Subtracting the per-head key mean is exact: it moves every score of a row by the same constant, which softmax ignores. So `sageattn` on gfx12 now always smooths K, on every path including PR #368's; `smooth_k=False` is accepted and gives the same bits as `True`, and K is not modified in place.
+
+**Status:** v0.6.0.

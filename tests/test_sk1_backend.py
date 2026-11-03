@@ -191,15 +191,31 @@ def test_hip_prologue_is_the_default():
     assert hp.n_calls > before
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("head_dim", [128, 64])
+def test_smooth_k_is_always_on(dtype, head_dim):
+    # Stock ComfyUI passes smooth_k=False. Smoothing is exact, so it is applied anyway: the same bits
+    # as smooth_k=True, on the kernels here and on PR #368's path (head_dim 64), and keys that share
+    # one large direction stay accurate.
+    q, k, v = _rand_qkv(1, 8, 1000, seed=5, dtype=dtype, head_dim=head_dim)
+    k = k + 8 * torch.randn(1, 1, 1, head_dim, device="cuda", dtype=dtype)
+    k_before = k.clone()
+    off = _sageattn()(q, k, v, tensor_layout="HND", smooth_k=False)
+    assert torch.equal(off, _sageattn()(q, k, v, tensor_layout="HND", smooth_k=True))
+    assert torch.equal(k, k_before)
+    assert _rel_rms(off, _reference(q, k, v, False)) < MAX_REL_RMS
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 def test_triton_prologue_gives_the_same_bits_without_smooth_k(dtype):
     code = """
         import hashlib, torch
-        from sageattention import sageattn
+        from sageattention.sk1_backend import try_sk1_t1
         g = torch.Generator(device="cuda").manual_seed(0)
         q, k, v = [torch.randn(1, 8, 777, 128, device="cuda", dtype=torch.%s, generator=g)
                    for _ in range(3)]
-        out = sageattn(q, k, v, tensor_layout="HND", smooth_k=False)
+        out, reason = try_sk1_t1(q, k, v, tensor_layout="HND", smooth_k=False, i8pv=False)
+        assert out is not None, reason
         print("RESULT", hashlib.sha256(out.float().cpu().numpy().tobytes()).hexdigest())
     """ % dtype
     assert _run_fresh(code, SAGEATTN_SK1_PROLOGUE="hip") == _run_fresh(code, SAGEATTN_SK1_PROLOGUE="triton")

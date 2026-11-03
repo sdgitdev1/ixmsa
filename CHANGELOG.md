@@ -15,6 +15,10 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
   against PR #368's 0.0126 and v0.5's 0.0139, lower than PR #368's on all 18. It uses comfy-kitchen's lazy rescale and
   kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
   others, which keeps Krea2's outlier layers accurate), and a seeded Q·K accumulator (F174). bf16 now uses int8 Q·K too.
+- **K is always smoothed.** Stock ComfyUI calls `sageattn(..., smooth_k=False)`, and without the key mean
+  subtracted int8 K breaks on layers with extreme keys: Krea2's first block went from 0.008–0.015 relative error to
+  0.20–0.36, on PR #368's path as well. The subtraction is exact and costs under 1 %, so `smooth_k=False` is now
+  ignored on gfx12 (F176).
 - Their K/V statistics take one launch: V is read in full, the K mean comes from about 1024 sampled rows. Error on the
   18 captures is unchanged.
 - **`sageattention.fp8_linear`**: an fp8 e4m3 linear with one activation scale per token (HIP quantize,

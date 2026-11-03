@@ -1167,6 +1167,11 @@ def sageattn(
                 "Refusing to ignore it, because that would return silently wrong "
                 "output. Pass mask=None, or use a backend that supports masking."
             )
+        # K is always smoothed, whatever the caller asks. Subtracting the per-head key mean is exact
+        # (it moves every score of a row by one constant, which softmax ignores) and costs under 1 %,
+        # while int8 K without it loses layers whose keys share one direction: Krea2's first block goes
+        # from 0.008-0.015 relative error to 0.20-0.36 (F176). Stock ComfyUI passes smooth_k=False.
+        kwargs["smooth_k"] = True
         fast_path_keys = {"value_dtype", "smooth_k", "qk_quant_gran", "pv_accum_dtype", "smooth_v"}
         # ------------------------------------------------------------------ prebuilt SK1
         # ON by default, and the packaged object is `attn_fp8qk_f16` (the p*amax_v fp8 overflow of
