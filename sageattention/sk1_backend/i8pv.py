@@ -1,7 +1,7 @@
 """int8 Q.K + int8 P.V attention: `kv_prologue_i8pv` and the `attn_i8pv_{grp,tok}_{f16,bf16}[_strided]` objects
 (sources `kernels/hip/attn_i8pv.h`, `kernels/hip/kv_prologue_i8pv.hip`).
 
-A call is three prologue launches (K/V statistics over two row chunks, their in-order reduction, the
+A call is two prologue launches (the K mean from ~1024 sampled rows, the V statistics from every row; then the
 quantisation) and two attention launches on the same prologue output. Per 64-key tile the prologue takes one K
 scale per 16 keys where that costs no key more than log2(1/TAU) = 2 bits, per-token scales elsewhere, and
 flags each head whose tiles all took group scales. The `grp` object serves the flagged heads (group scale and
@@ -24,7 +24,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 HD = 128
 BN = 64
 TAU = 0.25
-CHUNKS = 2          # row chunks of the statistics pass
+K_ROWS = 1024       # rows the K mean is taken from (all of them up to this length)
 TAGS = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 
@@ -54,9 +54,8 @@ class I8pv:
         self.arch = arch
         self.rt = HipRuntime()
         mod = self.rt.load_module(object_path("kv_prologue_i8pv", arch))
-        self.f_stats = {dt: self.rt.get_function(mod, "kv_prologue_i8pv_stats_" + t) for dt, t in TAGS.items()}
+        self.f_stats = {dt: self.rt.get_function(mod, "kv_prologue_i8pv_stats1_" + t) for dt, t in TAGS.items()}
         self.f_quant = {dt: self.rt.get_function(mod, "kv_prologue_i8pv_quant_" + t) for dt, t in TAGS.items()}
-        self.f_fin = self.rt.get_function(mod, "kv_prologue_i8pv_fin")
         self._fns = {}
         self._keep = None
 
@@ -84,26 +83,18 @@ class I8pv:
         sv = torch.empty(BH, n_pad, dtype=torch.float32, device=dev)
         kmean = torch.empty(BH, D, dtype=torch.float32, device=dev)
         vmean = torch.empty(BH, D, dtype=torch.float32, device=dev)
-        pk = torch.empty(BH, 16 * CHUNKS, D, dtype=torch.float64, device=dev)
-        pv = torch.empty_like(pk)
-        pmx = torch.empty(BH, 16 * CHUNKS, D, dtype=torch.float32, device=dev)
-        pmn = torch.empty_like(pmx)
         P, I64 = ctypes.c_void_p, ctypes.c_int64
         strides = [I64(k.stride(0)), I64(k.stride(1)), I64(k.stride(2)), I64(v.stride(0)), I64(v.stride(1)),
                    I64(v.stride(2))]
-        chunk = ((N + CHUNKS - 1) // CHUNKS + 15) // 16 * 16
-        a1 = [P(k.data_ptr()), P(v.data_ptr()), P(pk.data_ptr()), P(pv.data_ptr()), P(pmx.data_ptr()),
-              P(pmn.data_ptr()), I64(N), I64(H), I64(chunk)] + strides
-        a2 = [P(pk.data_ptr()), P(pv.data_ptr()), P(pmx.data_ptr()), P(pmn.data_ptr()), P(kmean.data_ptr()),
-              P(vmean.data_ptr()), P(sv.data_ptr()), I64(N), I64(n_pad), ctypes.c_int(16 * CHUNKS)]
+        a1 = [P(k.data_ptr()), P(v.data_ptr()), P(kmean.data_ptr()), P(vmean.data_ptr()), P(sv.data_ptr()), I64(N),
+              I64(n_pad), I64(H), I64(max(1, N // K_ROWS))] + strides
         a3 = [P(k.data_ptr()), P(v.data_ptr()), P(k8.data_ptr()), P(sk.data_ptr()), P(v8t.data_ptr()),
               P(sv.data_ptr()), P(kmean.data_ptr()), P(vmean.data_ptr()), I64(N), I64(n_pad), I64(H)] + strides + \
             [ctypes.c_float(1e-12), ctypes.c_int(1 if smooth_k else 0), ctypes.c_float(TAU)]
         st = torch_stream()
-        launches = [self.rt.launch(self.f_stats[k.dtype], (BH, CHUNKS, 1), (256, 1, 1), 0, st, a1),
-                    self.rt.launch(self.f_fin, (BH, 1, 1), (HD, 1, 1), 0, st, a2),
+        launches = [self.rt.launch(self.f_stats[k.dtype], (BH, 1, 1), (256, 1, 1), 0, st, a1),
                     self.rt.launch(self.f_quant[k.dtype], (n_pad // BN, BH, 1), (256, 1, 1), 0, st, a3)]
-        self._keep_pro = (a1, a2, a3, launches)
+        self._keep_pro = (a1, a3, launches)
         return k8, sk, v8t, sv, vmean, n_pad
 
     def run(self, qq, kk, vv, out, causal, sm_scale, smooth_k, contiguous_hnd):

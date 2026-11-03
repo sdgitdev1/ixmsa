@@ -1,10 +1,8 @@
-// K/V quantisation for the attn_i8pv_* kernels. Three launches per call:
+// K/V quantisation for the attn_i8pv_* kernels. Two launches per call:
 //
-//   kv_prologue_i8pv_stats_{f16,bf16}  grid (B*H, S), block 256: per-channel partial sums of K and V (fp32,
-//                                      Neumaier-compensated, written as fp64) and V max / min, over S row chunks.
-//   kv_prologue_i8pv_fin               grid (B*H), block 128: reduces the 16*S partial slots in a fixed order
-//                                      (deterministic) into the K mean, the V mean and the per-channel V scale
-//                                      s_d = max|v - vmean| / 127; sets the head flag to 1.
+//   kv_prologue_i8pv_stats1_{f16,bf16} grid (B*H), block 256: the K mean (from every `step`-th row; the caller picks
+//                                      ~1024 rows), the V mean and the per-channel V scale s_d = max|v - vmean| / 127
+//                                      (from every row); sets the head flag to 1.
 //   kv_prologue_i8pv_quant_{f16,bf16}  grid (N_pad/64, B*H), block 256: one 64-key tile per block.
 //       K: k - kmean, per-token amax. A 16-key group's scale is the group max; the tile takes group scales if every
 //          live key's amax is >= TAU * its group max (a group scale then costs any key at most log2(1/TAU) bits),
@@ -58,76 +56,72 @@ __device__ __forceinline__ void nsum(float& s, float& c, float x) {
   s = t;
 }
 
-// 16 lanes (8 channels each, one 16-byte load per row) x 16 rows in flight; each (chunk, row lane) owns one
-// of the 16*S partial slots.
+// One block per (b, h): per-channel K mean, V mean and V max / min, the fp32 partial sums of the 16 row lanes
+// reduced in fp64 in a fixed order (deterministic). V is read in full; K only every `step`-th row.
 template <typename T>
-__device__ __forceinline__ void stats_body(const T* __restrict__ K, const T* __restrict__ V, double* __restrict__ PK,
-                                           double* __restrict__ PV, float* __restrict__ PMX, float* __restrict__ PMN,
-                                           long long N, long long H, long long chunk,
-                                           long long k_sb, long long k_sh, long long k_sr,
-                                           long long v_sb, long long v_sh, long long v_sr) {
+__device__ __forceinline__ void stats1_body(const T* __restrict__ K, const T* __restrict__ V, float* __restrict__ KMEAN,
+                                            float* __restrict__ VMEAN, float* __restrict__ SV, long long N, long long N_pad,
+                                            long long H, long long step, long long k_sb, long long k_sh, long long k_sr,
+                                            long long v_sb, long long v_sh, long long v_sr) {
+  __shared__ double rk[16][HD], rv[16][HD];
+  __shared__ float rmx[16][HD], rmn[16][HD];
   const int tx = threadIdx.x & 15, ty = threadIdx.x >> 4;
-  const int bh = blockIdx.x, S = gridDim.y, sp = blockIdx.y;
+  const int bh = blockIdx.x;
   const int b = (int)(bh / H);
   const int h = (int)(bh - (long long)b * H);
   const long long kb = (long long)b * k_sb + (long long)h * k_sh + 8 * tx;
   const long long vb_ = (long long)b * v_sb + (long long)h * v_sh + 8 * tx;
-  const long long n0 = (long long)sp * chunk, n1 = min(N, n0 + chunk);
   float ks[8], kc[8], vs[8], vc[8], mx[8], mn[8];
   #pragma unroll
   for (int t = 0; t < 8; t++) { ks[t] = kc[t] = vs[t] = vc[t] = 0.f; mx[t] = -INFINITY; mn[t] = INFINITY; }
-  for (long long n = n0 + ty; n < n1; n += 16) {
-    float kx[8], vx[8];
-    load8<T>(K + kb + n * k_sr, kx);
+  // V: every row (its channel max sets the V scale, and a missed outlier would cost its tile 5 bits).
+  // K: every `step`-th row; any K mean is exact for attention, so a sample only changes the K ranges.
+  for (long long n = ty; n < N; n += 16) {
+    float vx[8];
     load8<T>(V + vb_ + n * v_sr, vx);
     #pragma unroll
     for (int t = 0; t < 8; t++) {
-      nsum(ks[t], kc[t], kx[t]);
       nsum(vs[t], vc[t], vx[t]);
       mx[t] = fmaxf(mx[t], vx[t]);
       mn[t] = fminf(mn[t], vx[t]);
     }
   }
-  const long long o = ((long long)bh * (16 * S) + sp * 16 + ty) * HD + 8 * tx;
+  for (long long n = ty * step; n < N; n += 16 * step) {
+    float kx[8];
+    load8<T>(K + kb + n * k_sr, kx);
+    #pragma unroll
+    for (int t = 0; t < 8; t++) nsum(ks[t], kc[t], kx[t]);
+  }
   #pragma unroll
   for (int t = 0; t < 8; t++) {
-    PK[o + t] = (double)ks[t] + (double)kc[t];
-    PV[o + t] = (double)vs[t] + (double)vc[t];
-    PMX[o + t] = mx[t];
-    PMN[o + t] = mn[t];
+    rk[ty][8 * tx + t] = (double)ks[t] + (double)kc[t];
+    rv[ty][8 * tx + t] = (double)vs[t] + (double)vc[t];
+    rmx[ty][8 * tx + t] = mx[t];
+    rmn[ty][8 * tx + t] = mn[t];
+  }
+  __syncthreads();
+  if (threadIdx.x < HD) {
+    const int d = threadIdx.x;
+    double sk_ = 0.0, sv_ = 0.0;
+    float m1 = -INFINITY, m0 = INFINITY;
+    for (int i = 0; i < 16; i++) { sk_ += rk[i][d]; sv_ += rv[i][d]; m1 = fmaxf(m1, rmx[i][d]); m0 = fminf(m0, rmn[i][d]); }
+    KMEAN[(long long)bh * HD + d] = (float)(sk_ / (double)((N - 1) / step + 1));
+    const float mu = (float)(sv_ / (double)N);
+    VMEAN[(long long)bh * HD + d] = mu;
+    if (d == 0) SV[(long long)bh * N_pad + HD + 2 * (N_pad / BN)] = 1.0f;
+    SV[(long long)bh * N_pad + d] = __fdiv_rn(fmaxf(fmaxf(m1 - mu, mu - m0), 1e-8f), 127.0f);
   }
 }
 
-#define STATS_ARGS(T)                                                                                      \
-  const T* __restrict__ K, const T* __restrict__ V, double* __restrict__ PK, double* __restrict__ PV,      \
-      float* __restrict__ PMX, float* __restrict__ PMN, long long N, long long H, long long chunk,         \
-      long long k_sb, long long k_sh, long long k_sr, long long v_sb, long long v_sh, long long v_sr
-#define STATS_PASS K, V, PK, PV, PMX, PMN, N, H, chunk, k_sb, k_sh, k_sr, v_sb, v_sh, v_sr
+#define STATS1_ARGS(T)                                                                                      const T* __restrict__ K, const T* __restrict__ V, float* __restrict__ KMEAN, float* __restrict__ VMEAN,           float* __restrict__ SV, long long N, long long N_pad, long long H, long long step, long long k_sb,            long long k_sh, long long k_sr, long long v_sb, long long v_sh, long long v_sr
+#define STATS1_PASS K, V, KMEAN, VMEAN, SV, N, N_pad, H, step, k_sb, k_sh, k_sr, v_sb, v_sh, v_sr
 
-extern "C" __global__ void __launch_bounds__(256) kv_prologue_i8pv_stats_f16(STATS_ARGS(f16)) {
-  stats_body<f16>(STATS_PASS);
+extern "C" __global__ void __launch_bounds__(256) kv_prologue_i8pv_stats1_f16(STATS1_ARGS(f16)) {
+  stats1_body<f16>(STATS1_PASS);
 }
 
-extern "C" __global__ void __launch_bounds__(256) kv_prologue_i8pv_stats_bf16(STATS_ARGS(__bf16)) {
-  stats_body<__bf16>(STATS_PASS);
-}
-
-extern "C" __global__ void __launch_bounds__(128)
-kv_prologue_i8pv_fin(const double* __restrict__ PK, const double* __restrict__ PV, const float* __restrict__ PMX,
-                     const float* __restrict__ PMN, float* __restrict__ KMEAN, float* __restrict__ VMEAN,
-                     float* __restrict__ SV, long long N, long long N_pad, int S) {
-  const int bh = blockIdx.x, d = threadIdx.x;
-  double sk_ = 0.0, sv_ = 0.0;
-  float m1 = -INFINITY, m0 = INFINITY;
-  for (int sp = 0; sp < S; sp++) {
-    const long long o = ((long long)bh * S + sp) * HD + d;
-    sk_ += PK[o]; sv_ += PV[o]; m1 = fmaxf(m1, PMX[o]); m0 = fminf(m0, PMN[o]);
-  }
-  KMEAN[(long long)bh * HD + d] = (float)(sk_ / (double)N);
-  const float mu = (float)(sv_ / (double)N);
-  VMEAN[(long long)bh * HD + d] = mu;
-  if (d == 0) SV[(long long)bh * N_pad + HD + 2 * (N_pad / BN)] = 1.0f;
-  SV[(long long)bh * N_pad + d] = __fdiv_rn(fmaxf(fmaxf(m1 - mu, mu - m0), 1e-8f), 127.0f);
+extern "C" __global__ void __launch_bounds__(256) kv_prologue_i8pv_stats1_bf16(STATS1_ARGS(__bf16)) {
+  stats1_body<__bf16>(STATS1_PASS);
 }
 
 template <typename T>
