@@ -47,10 +47,12 @@ def _inputs(shape, N, dtype, seed=0):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("shape,N", [((37, 256), 128), ((2, 19, 6144), 1536), ((300, 12288), 256), ((64, 12304), 64)])
+@pytest.mark.parametrize("shape,N", [((37, 256), 128), ((2, 19, 6144), 1536), ((300, 12288), 256), ((64, 12304), 64),
+                                     ((16, 32768), 16), ((70000, 64), 16)])
 @pytest.mark.parametrize("with_bias", [True, False])
 def test_matches_reference(shape, N, with_bias, dtype):
-    # (300, 12288) takes the two-GEMM K split; K = 12304 is long but not a multiple of 32, so it stays one GEMM
+    # (300, 12288) takes the two-GEMM K split; K = 12304 is long but not a multiple of 32, so it stays one GEMM;
+    # K = 32768 is the longest row; 70000 rows are more than a grid's y dimension holds
     x, w8, ws, bias = _inputs(shape, N, dtype)
     bias = bias if with_bias else None
     y = fp8_linear.linear(x, w8, ws, bias)
@@ -58,11 +60,21 @@ def test_matches_reference(shape, N, with_bias, dtype):
     assert _rel(y, _reference(x, w8, ws, bias)) < MAX_REL[dtype]
 
 
-def test_strided_rows():
+def test_strided_and_unaligned_rows():
     x, w8, ws, bias = _inputs((50, 1040), 128, torch.float16)
-    xs = x[:, :1024]
-    y = fp8_linear.linear(xs, w8[:, :1024].contiguous(), ws, bias)
-    assert _rel(y, _reference(xs, w8[:, :1024], ws, bias)) < MAX_REL[torch.float16]
+    w = w8[:, :1024].contiguous()
+    xs = x[:, :1024]   # read in place through the row stride
+    assert _rel(fp8_linear.linear(xs, w, ws, bias), _reference(xs, w, ws, bias)) < MAX_REL[torch.float16]
+    xu = x.flatten()[1:1 + 50 * 1024].view(50, 1024)   # not 16-byte aligned: copied first
+    assert _rel(fp8_linear.linear(xu, w, ws, bias), _reference(xu, w, ws, bias)) < MAX_REL[torch.float16]
+
+
+def test_nan_input_gives_nan_output():
+    x, w8, ws, bias = _inputs((8, 256), 128, torch.float16)
+    x[3, 5] = float("nan")
+    y = fp8_linear.linear(x, w8, ws, bias)
+    assert torch.isnan(y[3]).all()
+    assert torch.isfinite(y[torch.arange(8, device="cuda") != 3]).all()
 
 
 def test_fp16_output_far_above_the_input_max_stays_finite():
@@ -83,3 +95,14 @@ def test_refusals_return_none():
     assert fp8_linear.linear(x, w8, torch.full((128,), 0.02, device="cuda")) is None
     assert fp8_linear.linear(x, w8.t().contiguous().t(), ws) is None
     assert fp8_linear.linear(x[:0], w8, ws) is None
+    long_k = torch.zeros(16, 32784, device="cuda").to(torch.float8_e4m3fn)
+    assert fp8_linear.linear(torch.zeros(4, 32784, device="cuda", dtype=torch.float16), long_k, ws) is None
+
+
+def test_autograd_inputs_are_refused():
+    # the HIP passes are not differentiable, so a call autograd has to see through goes back to the caller
+    x, w8, ws, bias = _inputs((16, 256), 128, torch.float16)
+    assert fp8_linear.linear(x.requires_grad_(), w8, ws) is None
+    assert fp8_linear.linear(x.detach(), w8, ws, bias.requires_grad_()) is None
+    with torch.no_grad():
+        assert fp8_linear.linear(x, w8, ws, bias) is not None

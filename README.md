@@ -267,7 +267,8 @@ Krea2 Turbo), which ComfyUI otherwise runs as dequantize + fp16 GEMM. At Krea2's
 0.61–0.70× the time of that path, with the error of the checkpoint's other fp8 layers (F175); a Krea2
 step at 1672×1256 goes from 2.38 s to 2.12 s. Neither `sageattn` nor ComfyUI calls it on its own: a
 node or patch has to route those layers to it. A call it does not take (other dtypes, a per-channel
-scale, K or N not a multiple of 16, K over 32 768, no code object for the GPU) returns `None`.
+scale, K or N not a multiple of 16, K over 32 768, no code object for the GPU, or one autograd needs a
+gradient through) returns `None`.
 
 ## Build from source
 

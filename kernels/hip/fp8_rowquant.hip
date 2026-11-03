@@ -4,7 +4,7 @@
 //                            SX[m] = max(|X[m, :]|, 1e-12), X8 = rne(448 X / SX[m]) clamped to +-448. X8 is written as
 //                            `parts` contiguous (M, K / parts) blocks, so each K slice is a contiguous GEMM operand
 //                            (hipBLASLt runs ~1.6x slower when an operand's leading dimension exceeds its width).
-//   fp8_rowscale_{f16,bf16}  grid (ceil(N / 2048), M), block 256. Y0 = (Y0 [+ Y1]) * SX[m] [+ bias], in place, Y0 / Y1
+//   fp8_rowscale_{f16,bf16}  grid (M, ceil(N / 2048)), block 256 (M on x: grid y stops at 65535). Y0 = (Y0 [+ Y1]) * SX[m] [+ bias], in place, Y0 / Y1
 //                            (M, N) row-major in the GEMM's output type; Y1 and bias may be null. The GEMM runs with
 //                            scale_a = 1 / 448, so Y0 holds y / SX[m] and cannot overflow fp16 where y does not.
 //
@@ -65,7 +65,10 @@ __device__ __forceinline__ void rowquant_body(const T* __restrict__ X, uint8_t* 
     if (c < nch) {
       float y[8];
 #pragma unroll
-      for (int e = 0; e < 8; e++) y[e] = fminf(fmaxf(v[i][e] * inv, -448.0f), 448.0f);
+      for (int e = 0; e < 8; e++) {
+        const float t = v[i][e] * inv;   // a NaN stays NaN (fminf / fmaxf would make it -448)
+        y[e] = t > 448.0f ? 448.0f : (t < -448.0f ? -448.0f : t);
+      }
       // v_cvt_pk_fp8_f32 packs two values into the low (false) or high (true) 16 bits
       int lo = __builtin_amdgcn_cvt_pk_fp8_f32(y[0], y[1], 0, false);
       lo = __builtin_amdgcn_cvt_pk_fp8_f32(y[2], y[3], lo, true);
@@ -80,8 +83,8 @@ __device__ __forceinline__ void rowquant_body(const T* __restrict__ X, uint8_t* 
 template <typename T>
 __device__ __forceinline__ void rowscale_body(T* __restrict__ Y0, const T* __restrict__ Y1, const float* __restrict__ SX,
                                               const T* __restrict__ bias, int M, int N) {
-  const int m = blockIdx.y;
-  const int n = (blockIdx.x * NT + threadIdx.x) * 8;
+  const int m = blockIdx.x;
+  const int n = (blockIdx.y * NT + threadIdx.x) * 8;
   if (n >= N) return;
   const float s = SX[m];
   T* yr = Y0 + (long long)m * N + n;

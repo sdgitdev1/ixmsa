@@ -9,8 +9,9 @@
 3. one HIP pass sums the halves, applies the row scales and adds the bias.
 
 Returns None when the call is outside that (no GPU object for this arch, activations other than non-empty fp16/bf16,
-a weight that is not a contiguous e4m3 (N, K) tensor with one scale, K or N not a multiple of 16, K over 32768), so
-the caller keeps its own path.
+a weight that is not a contiguous e4m3 (N, K) tensor with one scale, K or N not a multiple of 16, K over 32768, or
+autograd needing a gradient through x or bias: the HIP passes are not differentiable), so the caller keeps its own
+path.
 """
 from __future__ import annotations
 
@@ -27,18 +28,20 @@ _TAGS = {torch.float16: "f16", torch.bfloat16: "bf16"}
 
 
 def _functions(device):
-    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    if arch not in _FNS:
+    # per device: hipModuleLoadData loads the code object for the current device only
+    if device.index not in _FNS:
         from .sk1_backend.sk1_loader import HipRuntime
+        arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
         path = os.path.join(_HERE, "fp8_rowquant.%s.hsaco" % arch)
         if not os.path.isfile(path):
-            _FNS[arch] = None
+            _FNS[device.index] = None
         else:
             rt = HipRuntime()
-            mod = rt.load_module(path)
-            _FNS[arch] = (rt, {t: (rt.get_function(mod, "fp8_rowquant_" + t), rt.get_function(mod, "fp8_rowscale_" + t))
-                               for t in _TAGS.values()})
-    return _FNS[arch]
+            with torch.cuda.device(device):
+                mod = rt.load_module(path)
+            _FNS[device.index] = (rt, {t: (rt.get_function(mod, "fp8_rowquant_" + t), rt.get_function(mod, "fp8_rowscale_" + t))
+                                       for t in _TAGS.values()})
+    return _FNS[device.index]
 
 
 def linear(x, w8, w_scale, bias=None):
@@ -46,6 +49,8 @@ def linear(x, w8, w_scale, bias=None):
         return None
     N, K = w8.shape
     if x.shape[-1] != K or K % 16 or N % 16 or K > 32768 or w_scale.numel() != 1 or not w8.is_contiguous():
+        return None
+    if torch.is_grad_enabled() and (x.requires_grad or (bias is not None and bias.requires_grad)):
         return None
     fns = _functions(x.device)
     if fns is None:
@@ -76,6 +81,6 @@ def linear(x, w8, w_scale, bias=None):
     b = None if bias is None else bias.to(dtype=x.dtype).contiguous()
     a2 = [P(y0.data_ptr()), P(0 if y1 is None else y1.data_ptr()), P(sx.data_ptr()), P(0 if b is None else b.data_ptr()),
           I(M), I(N)]
-    k2 = rt.launch(f_scale, ((N + 2047) // 2048, M, 1), (256, 1, 1), 0, stream, a2)
+    k2 = rt.launch(f_scale, (M, (N + 2047) // 2048, 1), (256, 1, 1), 0, stream, a2)
     _KEEP[:] = (a1, a2, k1, k2)
     return y0.reshape(*shape[:-1], N)
