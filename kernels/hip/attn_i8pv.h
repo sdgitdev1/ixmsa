@@ -1,20 +1,20 @@
 // int8 Q.K and int8 P.V attention, head_dim 128, for RDNA4. Shared body of the eight attn_i8pv_* objects; each
 // .hip file sets three macros and includes this:
 //
-//   I8PV_MIX      0: serves a call whose every head kv_prologue_i8pv flagged "group" (every 16-key group of the head
-//                    kept each key's amax within a factor TAU of the group max), with one K scale per 16 keys on
-//                    interior tiles. 1: serves any other call, each head on its own path (per-token K scales on the
-//                    heads not flagged). Launch both on the same prologue output; the one the call flag does not
-//                    pick returns at once. One launch per call, because two launches that split the heads leave two
-//                    partly idle tails: on a real Krea2 call with 24 group heads of 48 that cost 6 %.
+//   I8PV_MIX      0: serves a call whose every tile kv_prologue_i8pv gave group scales (every 16-key group kept each
+//                    key's amax within a factor TAU of the group max): one K scale per 16 keys on interior tiles.
+//                    1: serves any other call; each interior tile takes the group path or per-token K scales as the
+//                    prologue flagged it. Launch both on the same prologue output; the one the call flag does not
+//                    pick returns at once, so a call is one launch (two launches that split a call's heads leave two
+//                    partly idle tails: 6 % on a real Krea2 call).
 //   I8PV_STRIDED  1: Q and O addressed by (row, head, batch) element strides (strided HND views and NHD).
 //   I8PV_BF16     1: bf16 Q and O; 0: fp16.
 //   I8PV_NAME     symbol prefix: I8PV_NAME_fwd and I8PV_NAME_fwd_causal.
 //
 // Inputs (from kv_prologue_i8pv): K8 (BH, N_pad, 128) int8 after the K mean, SK (BH, N_pad) its per-key scale;
 // V8T (BH, 128, N_pad) int8 of (v - vmean) / s_d / f_j, VMEAN (BH, 128); SV (BH, N_pad) holds s_d at [0, 128),
-// the tile flags at [128, 128 + nt), f_j at [128 + nt, 128 + 2 nt), the head flag at 128 + 2 nt and, in head 0's
-// row only, the call flag (every head flagged group) at 129 + 2 nt.
+// the tile flags at [128, 128 + nt), f_j at [128 + nt, 128 + 2 nt) and, in head 0's row only, the call flag (every
+// tile of the call took group scales) at 128 + 2 nt.
 // Q is quantised to int8 per token here. sm_scale must be positive (the max of scaled scores is taken as the
 // scaled max).
 //
@@ -117,12 +117,12 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   const int n_tiles = N_pad / BN;
   const int j_hi = CAUSAL ? min(n_tiles, 2 * start_m + 2) : n_tiles;
   const int full = CAUSAL ? 2 * start_m : n_tiles;
-  // the call flag picks the object; the head flag is per (b, h), so a whole block takes one path
+  // the call flag picks the object
 #if I8PV_MIX
-  if (SV[HD + 2 * n_tiles + 1] != 0.f) return;
-  const bool head_grp = SV[bh * N_pad + HD + 2 * n_tiles] != 0.f;
+  if (SV[HD + 2 * n_tiles] != 0.f) return;
+  const float* const tile_grp = SV + bh * N_pad + HD;
 #else
-  if (SV[HD + 2 * n_tiles + 1] == 0.f) return;
+  if (SV[HD + 2 * n_tiles] == 0.f) return;
 #endif
 
   // ---- Q: raw 16-bit -> int8, one scale per token ----
@@ -224,6 +224,15 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   auto iter = [&](auto bnd, auto g, int j) {
     constexpr bool BND = decltype(bnd)::v;
     constexpr bool grp = decltype(g)::v && !BND;
+    // Mixed object, interior tile: the group path if the prologue gave this tile group scales, whatever its head
+    // (outlier keys are usually a few tiles of a head), else per-token scales. Both keep the score in sci, as the
+    // seeded bits or as the scaled fp32 bits, so phase 2 is one code path and nothing else stays live.
+    constexpr bool dyn = I8PV_MIX && !BND;
+#if I8PV_MIX
+    const bool tg = dyn && tile_grp[j] != 0.f;
+#else
+    constexpr bool tg = false;
+#endif
     if (j) __syncthreads();
     stage(j);
     __syncthreads();
@@ -255,7 +264,7 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk)
 #pragma unroll
-        for (int e = 0; e < 8; ++e) sci[st][kk][e] = grp ? MAGIC_I : 0;
+        for (int e = 0; e < 8; ++e) sci[st][kk][e] = (grp || dyn) ? MAGIC_I : 0;
 #pragma unroll
       for (int dt = 0; dt < 8; ++dt)
 #pragma unroll
@@ -265,7 +274,23 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
         }
       // two accumulators in flight, without every K fragment hoisted ahead of them
       __builtin_amdgcn_sched_barrier(0);
-      if (grp) {
+      if (dyn && !tg) {
+        // per-token scales on a seeded score: (bits - 1.5*2^23) is s exactly, so this is (float)s * scale
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          const f32x4 k0 = *(const f32x4*)(skb + st * 32 + kk * 16);
+          const f32x4 k1 = *(const f32x4*)(skb + st * 32 + kk * 16 + 4);
+          const float skv[8] = {k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w};
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const float x = (__builtin_bit_cast(float, (int)sci[st][kk][e]) - MAGIC_F) * skv[e];
+            sci[st][kk][e] = __builtin_bit_cast(int, x);
+            lmax = fmaxf(lmax, x);
+          }
+        }
+        continue;
+      }
+      if (grp || tg) {
         // One scale per 16 keys (the group's first key carries it; the prologue wrote the same value for all
         // 16), read as a wave-uniform scalar load. Each seeded score read as fp32 is 1.5*2^23 + s exactly
         // (|s| <= 128*127*127 < 2^22).
@@ -338,6 +363,12 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #pragma unroll
           for (int e = 0; e < 8; ++e)
             p[e] = __builtin_amdgcn_exp2f(fmaf(__builtin_bit_cast(float, (int)sci[st][kk][e]), gq[st][kk], cg));
+        } else if (dyn) {
+          const float a = tg ? gq[st][kk] : c_q;
+          const float cg = tg ? fmaf(-MAGIC_F, gq[st][kk], -m_off) : -m_off;
+#pragma unroll
+          for (int e = 0; e < 8; ++e)
+            p[e] = __builtin_amdgcn_exp2f(fmaf(__builtin_bit_cast(float, (int)sci[st][kk][e]), a, cg));
         } else {
 #pragma unroll
           for (int e = 0; e < 8; ++e) p[e] = __builtin_amdgcn_exp2f(fmaf(sc[st][kk][e], c_q, -m_off));
@@ -382,11 +413,8 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   const int j_int = min(j_hi, CAUSAL ? full : N / BN);
   int j = 0;
 #if I8PV_MIX
-  // only the interior loop differs between the two paths; Q, the boundary tiles and the epilogue are shared
-  if (head_grp)
-    for (; j < j_int; ++j) iter(btag<false>{}, btag<true>{}, j);
-  else
-    for (; j < j_int; ++j) iter(btag<false>{}, btag<false>{}, j);
+  // interior tiles pick their scale kind per tile inside the body (see `dyn`)
+  for (; j < j_int; ++j) iter(btag<false>{}, btag<false>{}, j);
 #else
   for (; j < j_int; ++j) iter(btag<false>{}, btag<true>{}, j);
 #endif

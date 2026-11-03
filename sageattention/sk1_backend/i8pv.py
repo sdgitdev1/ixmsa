@@ -3,13 +3,13 @@
 
 A call is two prologue launches (the K mean from ~1024 sampled rows, the V statistics from every row; then the
 quantisation) and two attention launches on the same prologue output. Per 64-key tile the prologue takes one K
-scale per 16 keys where that costs no key more than log2(1/TAU) = 2 bits, per-token scales elsewhere, and
-flags each head whose tiles all took group scales, and the call when every head did. The `grp` object serves a
-call whose every head is flagged (group scale and a seeded Q.K on interior tiles); the `mix` object serves any
-other call, each head on its own path. The one the call flag does not pick returns at once, so the call runs as
-one launch: two launches that split the heads leave two partly idle tails.
+scale per 16 keys where that costs no key more than log2(1/TAU) = 2 bits, per-token scales elsewhere; it flags
+each tile, and the call when every tile took group scales. The `grp` object serves such a call (group scale and a
+seeded Q.K on interior tiles); the `mix` object serves any other call, each interior tile on the path its flag
+names. The one the call flag does not pick returns at once, so the call runs as one launch: two launches that
+split a call's heads leave two partly idle tails.
 
-Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 130 + 2 * N_pad / 64 (N >= 129), q/k/v logical
+Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 129 + 2 * N_pad / 64 (N >= 129), q/k/v logical
 (B, H, N, D) views that `strided_view_reason` accepts.
 """
 from __future__ import annotations

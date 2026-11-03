@@ -2,19 +2,17 @@
 //
 //   kv_prologue_i8pv_stats1_{f16,bf16} grid (B*H), block 256: the K mean (from every `step`-th row; the caller picks
 //                                      ~1024 rows), the V mean and the per-channel V scale s_d = max|v - vmean| / 127
-//                                      (from every row); sets the head flag to 1, and the call flag (head 0's
-//                                      SV[129 + 2 nt]) to 1.
+//                                      (from every row); sets the call flag (head 0's SV[128 + 2 nt]) to 1.
 //   kv_prologue_i8pv_quant_{f16,bf16}  grid (N_pad/64, B*H), block 256: one 64-key tile per block.
 //       K: k - kmean, per-token amax. A 16-key group's scale is the group max; the tile takes group scales if every
 //          live key's amax is >= TAU * its group max (a group scale then costs any key at most log2(1/TAU) bits),
 //          else per-token scales. SK holds each key's scale either way; the tile flag goes to SV[bh, 128 + tile]
-//          and a per-token tile clears the head flag SV[bh, 128 + 2 nt] and the call flag. K8 = rne(k / scale),
-//          clamped to int8.
+//          and a per-token tile clears the call flag. K8 = rne(k / scale), clamped to int8.
 //       V: (v - vmean) / s_d, the tile's amax f_j = max / 127 (floored at 1e-4) to SV[bh, 128 + nt + tile],
 //          V8T = rint(... / f_j) clamped to [-127, 127], stored transposed (BH, 128, N_pad).
 //
 // K and V may be any view with unit stride along the head dim (strided HND, NHD, fused QKV); padding rows get
-// K8 = 0, SK = 1, V8T = 0. SV must hold N_pad >= 130 + 2 nt floats per head (true for N >= 129).
+// K8 = 0, SK = 1, V8T = 0. SV must hold N_pad >= 129 + 2 nt floats per head (true for N >= 129).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -110,8 +108,7 @@ __device__ __forceinline__ void stats1_body(const T* __restrict__ K, const T* __
     KMEAN[(long long)bh * HD + d] = (float)(sk_ / (double)((N - 1) / step + 1));
     const float mu = (float)(sv_ / (double)N);
     VMEAN[(long long)bh * HD + d] = mu;
-    if (d == 0) SV[(long long)bh * N_pad + HD + 2 * (N_pad / BN)] = 1.0f;
-    if (d == 0 && bh == 0) SV[HD + 2 * (N_pad / BN) + 1] = 1.0f;
+    if (d == 0 && bh == 0) SV[HD + 2 * (N_pad / BN)] = 1.0f;
     SV[(long long)bh * N_pad + d] = __fdiv_rn(fmaxf(fmaxf(m1 - mu, mu - m0), 1e-8f), 127.0f);
   }
 }
@@ -196,10 +193,7 @@ __device__ __forceinline__ void quant_body(const T* __restrict__ K, const T* __r
   kmax = tile_ok ? gmax : krow;
   if (tid == 0) SV[(long long)bh * N_pad + HD + blockIdx.x] = tile_ok ? 1.0f : 0.0f;
   // the bits of 1.0f and 0.0f order like the values, so an integer atomicMin is a logical AND
-  if (tid == 0 && !tile_ok) {
-    atomicMin((int*)&SV[(long long)bh * N_pad + HD + 2 * nt], 0);
-    atomicMin((int*)&SV[HD + 2 * nt + 1], 0);
-  }
+  if (tid == 0 && !tile_ok) atomicMin((int*)&SV[HD + 2 * nt], 0);
   float sk = fmaxf(__fdiv_rn(kmax, 127.0f), FLOOR);
   if (q == 0) SK[(long long)bh * N_pad + n] = live ? sk : 1.0f;
   #pragma unroll
