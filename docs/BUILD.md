@@ -72,6 +72,14 @@ Each object is `<name>.gfx1201.hsaco` or `<name>.gfx1200.hsaco`, built from `ker
 | `attn_int8qk_f16` | fp16 | int8 | contiguous HND |
 | `attn_int8qk_f16_strided` | fp16 | int8 | strided HND and NHD |
 | `kv_prologue` | fp16, bf16 | | K/V quantization before every call |
+| `attn_i8pv_grp_{f16,bf16}[_strided]` | fp16 / bf16 | int8, one K scale per 16 keys | heads the prologue flagged; int8 P·V |
+| `attn_i8pv_tok_{f16,bf16}[_strided]` | fp16 / bf16 | int8, per-token K | the other heads; int8 P·V |
+| `kv_prologue_i8pv` | fp16, bf16 | | K/V quantization for the `attn_i8pv` objects |
+
+The eight `attn_i8pv` objects share one body, `kernels/hip/attn_i8pv.h`; each `.hip` file sets the variant. They and
+`kv_prologue_i8pv` are built with ROCm 10.1's AMD clang 24 (point `SK1_ROCM_DEVEL` at a ROCm 10.1 `_rocm_sdk_devel`):
+the same source is ~1.5 % slower with ROCm 10.0's clang 23, which built the other objects. `--check` needs the
+compiler that built the object.
 
 ### Kernel names before v0.5
 

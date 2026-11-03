@@ -150,6 +150,10 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   }
 
   // ---- K / V tile -> LDS (one buffer: barrier, load, barrier, compute) ----
+  // The staging and the epilogue below each come in two forms that compute the same bytes. clang schedules the KV
+  // loop differently around them, and each object is faster with one: the contiguous objects by ~1 % with these
+  // two, the strided ones by 1-3 % with the other two (kernel time, A/A within 0.3 %).
+#if I8PV_STRIDED
   auto stage = [&](int j) {
     const uint8_t* kp = K8 + (bh * N_pad + (size_t)j * BN + (tid >> 2)) * HD + (tid & 3) * 32;
     const u32x4 kr0 = *(const u32x4*)kp, kr1 = *(const u32x4*)(kp + 16);
@@ -169,6 +173,36 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
       *(f32x4*)&sS[4 * tid] = *(const f32x4*)(SK + bh * N_pad + (size_t)j * BN + 4 * tid);
   };
 
+#else
+  u32x4 kr0, kr1, vr0, vr1;
+  f32x4 sr = {0.f, 0.f, 0.f, 0.f};
+  auto gload = [&](int j) {
+    const uint8_t* kp = K8 + (bh * N_pad + (size_t)j * BN + (tid >> 2)) * HD + (tid & 3) * 32;
+    kr0 = *(const u32x4*)kp;
+    kr1 = *(const u32x4*)(kp + 16);
+    const uint8_t* vp = V8T + (bh * HD + (tid >> 1)) * N_pad + (size_t)j * BN + (tid & 1) * 32;
+    vr0 = *(const u32x4*)vp;
+    vr1 = *(const u32x4*)(vp + 16);
+    if (tid < 16)
+      sr = *(const f32x4*)(SK + bh * N_pad + (size_t)j * BN + 4 * tid);
+  };
+  auto lstore = [&]() {
+    uint8_t* kd = &sK[(tid >> 2) * KSTRIDE + (tid & 3) * 32];
+    *(u32x2*)(kd + 0) = kr0.xy;
+    *(u32x2*)(kd + 8) = kr0.zw;
+    *(u32x2*)(kd + 16) = kr1.xy;
+    *(u32x2*)(kd + 24) = kr1.zw;
+    uint8_t* vd = &sV[(tid >> 1) * VSTRIDE + (tid & 1) * 32];
+    *(u32x2*)(vd + 0) = vr0.xy;
+    *(u32x2*)(vd + 8) = vr0.zw;
+    *(u32x2*)(vd + 16) = vr1.xy;
+    *(u32x2*)(vd + 24) = vr1.zw;
+    if (tid < 16)
+      *(f32x4*)&sS[4 * tid] = sr;
+  };
+  auto stage = [&](int j) { gload(j); lstore(); };
+
+#endif
   f32x8 acc[8];
 #pragma unroll
   for (int nt = 0; nt < 8; ++nt)
@@ -353,12 +387,21 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
     for (int nt = 0; nt < 8; ++nt) {
       const int d0 = nt * 16 + 8 * lh;
       const f32x4 s0 = *(const f32x4*)(SV + bh * N_pad + d0), s1 = *(const f32x4*)(SV + bh * N_pad + d0 + 4);
+#if I8PV_STRIDED
       const f32x4 m0 = *(const f32x4*)(VMEAN + bh * HD + d0), m1 = *(const f32x4*)(VMEAN + bh * HD + d0 + 4);
       const float vsv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
       const float vmv[8] = {m0.x, m0.y, m0.z, m0.w, m1.x, m1.y, m1.z, m1.w};
       qo8_t o;
 #pragma unroll
       for (int e = 0; e < 8; ++e) o[e] = (qo_t)(acc[nt][e] * inv * vsv[e] + vmv[e]);
+#else
+      const float vsv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+      qo8_t o;
+      // VMEAN is never null here; the test keeps clang from hoisting these loop-invariant loads above the KV
+      // loop, where they would hold 7 more VGPRs for the whole kernel (1 % slower).
+#pragma unroll
+      for (int e = 0; e < 8; ++e) o[e] = (qo_t)(acc[nt][e] * inv * vsv[e] + (VMEAN ? VMEAN[bh * HD + d0 + e] : 0.f));
+#endif
 #if I8PV_STRIDED
       *(qo8_t*)(O + obase + (size_t)qrow * (size_t)o_rstride + d0) = o;
 #else

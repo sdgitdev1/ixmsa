@@ -7,15 +7,24 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
 
 ## Unreleased (v0.6)
 
+- **New default kernels: int8 Q·K and int8 P·V** (`attn_i8pv_*`, `kv_prologue_i8pv`) for fp16 and bf16, head_dim 128,
+  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: 1.02 / 1.00 / 1.00 of its
+  time on contiguous HND and 1.02 / 0.96 / 0.96 on NHD at 4k / 8.8k / 16k tokens (fp16; bf16 the same within 1 %).
+  Against PR #368: 1.2–1.3× faster non-causal, 1.4–2.2× causal. Error on the 18 real captures: median 0.0072 in fp16
+  against PR #368's 0.0126 and v0.5's 0.0139, lower than PR #368's on all 18. It uses comfy-kitchen's lazy rescale and
+  kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
+  others, which keeps Krea2's outlier layers accurate), and a seeded Q·K accumulator (F174). bf16 now uses int8 Q·K too.
+- `SAGEATTN_SK1_I8PV=0` (or `sageattn(..., sk1_i8pv=False)`) turns the new kernels off; `SAGEATTN_SK1_INT8=0` does too
+  for fp16. head_dim 64, fewer than 135 tokens and `sm_scale <= 0` keep the previous objects.
 - **`SAGEATTN_CK=1`** hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it
-  is installed, since it measured faster and more accurate there (F167, F168). head_dim 64 stays on
-  PR #368's path, where comfy-kitchen is more accurate but slower (F171). Off by default.
+  is installed, for comparison (F167, F168). head_dim 64 stays on PR #368's path, where comfy-kitchen is more
+  accurate but slower (F171). Off by default.
 - The unshipped head_dim 64 prologue path and two unused helpers are gone; the loader closes the
   code object file after reading it.
 - `tools/gfx1200_probe.py` now shows the object the device would actually load (it always printed
   the gfx1201 name).
 - A test guards v0.5's first-call fix: the default path must not import Triton.
-- Default output is bit-identical to v0.5.0.
+- With `SAGEATTN_SK1_I8PV=0`, output is bit-identical to v0.5.0.
 
 ## v0.5.0 — 2.2.0+amd.gfx12.5
 
