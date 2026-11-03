@@ -19,6 +19,7 @@ Environment: `SK1_ROCM_BIN` (extra directory to search for the HIP runtime) and 
 from __future__ import annotations
 
 import ctypes
+import functools
 import glob
 import os
 import sys
@@ -113,22 +114,34 @@ def _candidate_bins() -> list:
     return cands
 
 
+@functools.lru_cache(maxsize=None)
 def rocm_bin_dir() -> str:
     """Directory holding the `amdhip64_7.dll` that torch already loaded, else the best fallback.
 
     Windows' loader keys on the resolved path, so loading the DLL from another directory yields a
     second, independent HIP runtime in the process; hence the already-loaded image is preferred.
+    The answer is kept for the process, since every kernel family builds its own `HipRuntime`.
     """
     override = os.environ.get("SK1_HIP_DLL")
     if override and os.path.isfile(override):
         return os.path.dirname(override)
-    # let torch load its own copy before we enumerate
+    # let torch load its own copy before we look for it
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.current_stream()
     except Exception:
         pass
+    if _IS_WINDOWS:
+        # the loaded image by name; enumerating every module takes ~40 ms in ComfyUI's process
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        k32.GetModuleHandleW.restype = wintypes.HMODULE
+        k32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        h = k32.GetModuleHandleW(_hip_lib_names()[0])
+        buf = ctypes.create_unicode_buffer(4096)
+        if h and k32.GetModuleFileNameW(h, buf, 4096):
+            return os.path.dirname(buf.value)
     for m in _enum_amdhip_modules():
         return os.path.dirname(m["path"])
     for c in _candidate_bins():
@@ -164,7 +177,6 @@ class HipRuntime:
             # RTLD_GLOBAL mirrors WinDLL's process-global visibility
             self.hip = ctypes.CDLL(self.dll_path, mode=ctypes.RTLD_GLOBAL)
         self._bind()
-        self.same_as_torch = self._verify_same_module()
         self.modules: list = []          # keep modules (and their images) alive
         self._keepalive = None           # the last launch's argument storage
 
@@ -198,8 +210,9 @@ class HipRuntime:
     def loaded_amdhip_modules(self) -> list:
         return _enum_amdhip_modules()
 
-    def _verify_same_module(self) -> dict:
-        """Evidence that ctypes and torch share one HIP runtime image.
+    @property
+    def same_as_torch(self) -> dict:
+        """Evidence that ctypes and torch share one HIP runtime image, computed when read.
 
         Equal `WinDLL` and `GetModuleHandleW` handles (both keyed on the module name) mean Windows
         returned the already-loaded image rather than mapping a second one.
