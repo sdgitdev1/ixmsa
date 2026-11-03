@@ -1164,7 +1164,7 @@ def sageattn(
     sk1_i8pv : Optional[bool]
         Serve the call with the int8 Q.K + int8 P.V objects (``attn_i8pv_*``) first.  Default ON.
         ``None`` reads ``SAGEATTN_SK1_I8PV`` (unset: on, falling back to the objects above for a call they
-        do not take: head_dim 64, ``sm_scale <= 0``, fewer than 135 tokens, or a failure).  ``False``
+        do not take: head_dim 64, ``sm_scale <= 0``, fewer than 129 tokens, or a failure).  ``False``
         skips them for this call; ``True`` is strict (a call they cannot serve raises).  An fp16 call
         with ``sk1_int8=False`` asked for fp8 Q.K and skips them too.
     """

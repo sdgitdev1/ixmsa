@@ -8,7 +8,7 @@ flags each head whose tiles all took group scales. The `grp` object serves the f
 a seeded Q.K on interior tiles), the `tok` object the others; each returns at once for a head that is not its
 kind, so every output row is written by exactly one of them.
 
-Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 129 + 2 * N_pad / 64 (N >= 135), q/k/v logical
+Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 129 + 2 * N_pad / 64 (N >= 129), q/k/v logical
 (B, H, N, D) views that `strided_view_reason` accepts.
 """
 from __future__ import annotations
@@ -111,6 +111,7 @@ class I8pv:
         (B*H, N, D) buffer for contiguous HND, else the logical (B, H, N, D) view to write, allocated by the caller.
         `out` is written in place. Both objects take the same arguments, so they are built once."""
         B, H, N, D = (int(x) for x in qq.shape)
+        fns = self.functions(qq.dtype, not contiguous_hnd)   # load (or fail) before any prologue work
         k8, sk, v8t, sv, vmean, n_pad = self.prologue(kk, vv, smooth_k)
         P, I = ctypes.c_void_p, ctypes.c_int
         args = [P(qq.data_ptr()), P(k8.data_ptr()), P(sk.data_ptr()), P(v8t.data_ptr()), P(sv.data_ptr()),
@@ -120,6 +121,6 @@ class I8pv:
         st = torch_stream()
         grid = ((N + 127) // 128, H, B)
         launches = [self.rt.launch(f[1] if causal else f[0], grid, (256, 1, 1), 0, st, args)
-                    for f in self.functions(qq.dtype, not contiguous_hnd)]
+                    for f in fns]
         # the argument storage must outlive the asynchronous launches
         self._keep = (args, launches, self._keep_pro)

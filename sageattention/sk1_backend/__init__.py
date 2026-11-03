@@ -36,7 +36,7 @@ Environment variables (read once, at import):
   normally. `0` sends bf16 calls to the shipped path (reason `"dtype"`). `1` is strict.
 * `SAGEATTN_SK1_PROLOGUE`: unset or `hip` quantises K and V with the HIP prologue, falling back to
   the Triton prologue for a call it cannot serve. `triton` uses the Triton prologue only.
-* `SAGEATTN_SK1_I8PV`: unset serves fp16/bf16 head_dim-128 calls with a positive scale and N >= 135 with the
+* `SAGEATTN_SK1_I8PV`: unset serves fp16/bf16 head_dim-128 calls with a positive scale and N >= 129 with the
   int8 P.V objects and falls back to the objects above for anything else or on a failure. `0` turns them off.
   `1` is strict: a call they cannot serve raises.
 * `SAGEATTN_SK1_GFX1200=1`: lets a gfx1200 device use the `*.gfx1200.hsaco` objects (the same
@@ -237,7 +237,7 @@ _BACKEND_B_FAILED = None
 _BACKEND_BN = None
 _BACKEND_BN_FAILED = None
 _LOGGED = False
-#: arch -> loaded `i8pv.I8pv`, or the exception its load raised
+#: arch -> loaded `i8pv.I8pv`, or the message of the error its load raised
 _I8PV = {}
 #: `sk1_loader.strided_view_reason`, imported once on first use: `_envelope_ok` runs the guard three
 #: times per attention call, so the import stays off the hot path.
@@ -556,6 +556,23 @@ def _load_i8n(arch=None):
         return None
 
 
+_I8PV_LOGGED = 0
+
+
+def _log_i8pv(msg: str) -> None:
+    """The int8 P.V path's own at-most-4-lines logger; the call still runs on the other SK1 objects, so this is
+    not `_log_once`'s "SK1 backend not used" line."""
+    global _I8PV_LOGGED
+    if _I8PV_LOGGED >= 4:
+        return
+    _I8PV_LOGGED += 1
+    try:
+        sys.stderr.write("[sageattention] int8 P.V kernels not used (%s); using the other SK1 objects.\n" % msg)
+        sys.stderr.flush()
+    except Exception:                                          # pragma: no cover
+        pass
+
+
 def _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm, smooth_k, arch, strict):
     """`(out, None)` from the int8 P.V objects, or `(None, reason)` for the caller to fall through. Raises
     only when `strict`."""
@@ -565,12 +582,21 @@ def _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm, smooth_k
         if strict:
             raise RuntimeError("the int8 P.V objects cannot serve this call (%s)" % why)
         return None, why
+    # A failed load is cached as its message, never as the exception: re-raising one exception object on every
+    # call would chain each call's frame (and its q/k/v) onto its traceback for the life of the process.
+    v = _I8PV.get(arch)
+    if isinstance(v, str):
+        if strict:
+            raise RuntimeError(v)
+        return None, "i8pv_load_failed"
     try:
-        v = _I8PV.get(arch)
         if v is None:
-            v = _I8PV[arch] = i8pv.I8pv(arch)
-        elif isinstance(v, Exception):
-            raise v
+            try:
+                v = i8pv.I8pv(arch)
+            except Exception as e:                                  # noqa: BLE001
+                _I8PV[arch] = "the int8 P.V objects did not load: %s" % e
+                raise
+            _I8PV[arch] = v
         import torch
         B, H, N, D = qq.shape
         if contiguous_hnd:
@@ -585,11 +611,9 @@ def _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm, smooth_k
             v.run(qq, kk, vv, out, bool(is_causal), sm, smooth_k, False)
         return out, None
     except Exception as e:                                          # noqa: BLE001
-        if arch not in _I8PV:
-            _I8PV[arch] = e
         if strict:
             raise
-        _log_once("int8 P.V path failed, using the previous SK1 objects: %s" % e)
+        _log_i8pv(str(e))
         return None, "i8pv_failed"
 
 
@@ -822,10 +846,15 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
     # The int8 P.V objects first; a call they do not take continues to the objects below. An fp16 call with int8
     # off (`int8=False` / `SAGEATTN_SK1_INT8=0`) asked for the fp8 Q.K objects, so it skips them.
     want_v = bool(SK1_I8PV) if i8pv is None else bool(i8pv)
-    if want_v and not d64 and (is_bf16 or (bool(SK1_INT8) if int8 is None else bool(int8))):
+    v_strict = SK1_I8PV_STRICT if i8pv is None else bool(i8pv)
+    int8_on = bool(SK1_INT8) if int8 is None else bool(int8)
+    if want_v and v_strict and (d64 or not (is_bf16 or int8_on)):
+        raise RuntimeError("the int8 P.V objects were demanded (SAGEATTN_SK1_I8PV=1 / sk1_i8pv=True) but %s"
+                           % ("they are head_dim 128 only" if d64 else "int8 is off for this fp16 call"))
+    if want_v and not d64 and (is_bf16 or int8_on):
         sm_v = float(sm_scale if sm_scale is not None else qq.size(3) ** -0.5)
         out, _ = _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm_v, bool(smooth_k), _arch,
-                           SK1_I8PV_STRICT if i8pv is None else bool(i8pv))
+                           v_strict)
         if out is not None:
             return out, None
     if int8 is None:

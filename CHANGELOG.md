@@ -15,7 +15,7 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
   kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
   others, which keeps Krea2's outlier layers accurate), and a seeded Q·K accumulator (F174). bf16 now uses int8 Q·K too.
 - `SAGEATTN_SK1_I8PV=0` (or `sageattn(..., sk1_i8pv=False)`) turns the new kernels off; `SAGEATTN_SK1_INT8=0` does too
-  for fp16. head_dim 64, fewer than 135 tokens and `sm_scale <= 0` keep the previous objects.
+  for fp16. head_dim 64, fewer than 129 tokens and `sm_scale <= 0` keep the previous objects.
 - **`SAGEATTN_CK=1`** hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it
   is installed, for comparison (F167, F168). head_dim 64 stays on PR #368's path, where comfy-kitchen is more
   accurate but slower (F171). Off by default.

@@ -338,3 +338,32 @@ def test_i8pv_switch_off():
         print("RESULT", torch.equal(sageattn(q, k, v), sageattn(q, k, v, sk1_i8pv=False)))
     """
     assert _run_fresh(code, SAGEATTN_SK1_I8PV="0") == ["True"]
+
+
+@pytest.mark.parametrize("head_dim, int8", [(64, None), (128, False)])
+def test_i8pv_strict_raises_where_it_cannot_serve(head_dim, int8):
+    # head_dim 64, and an fp16 call that asked for fp8 Q.K, are not served by the int8 P.V objects
+    q, k, v = _rand_qkv(1, 4, 512, seed=7, head_dim=head_dim)
+    with pytest.raises(RuntimeError):
+        _sageattn()(q, k, v, tensor_layout="HND", sk1_i8pv=True, sk1_int8=int8)
+
+
+def test_i8pv_failed_load_keeps_no_inputs_alive(monkeypatch):
+    import gc
+    import weakref
+    from sageattention import sk1_backend as sk1
+    from sageattention.sk1_backend import i8pv
+
+    def refuse(arch):
+        raise RuntimeError("no object")
+    monkeypatch.setattr(i8pv, "I8pv", refuse)
+    monkeypatch.setattr(sk1, "_I8PV", {})
+    refs = []
+    for _ in range(3):
+        q = torch.zeros(1, 2, 256, 128, dtype=torch.float16)
+        refs.append(weakref.ref(q))
+        assert sk1._try_i8pv(q, q, q, "HND", True, False, 0.1, True, "gfx1201", False)[0] is None
+        del q
+    gc.collect()
+    assert all(r() is None for r in refs)
+    assert isinstance(sk1._I8PV["gfx1201"], str)
