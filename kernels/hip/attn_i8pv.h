@@ -1,17 +1,20 @@
 // int8 Q.K and int8 P.V attention, head_dim 128, for RDNA4. Shared body of the eight attn_i8pv_* objects; each
 // .hip file sets three macros and includes this:
 //
-//   I8PV_GROUP    1: serves the heads kv_prologue_i8pv flagged "group" (every 16-key group of the head kept each
-//                    key's amax within a factor TAU of the group max), with one K scale per 16 keys on interior
-//                    tiles. 0: serves the other heads, with per-token K scales. Launch both on the same prologue
-//                    output; each block of a head that is not its kind returns at once.
+//   I8PV_MIX      0: serves a call whose every head kv_prologue_i8pv flagged "group" (every 16-key group of the head
+//                    kept each key's amax within a factor TAU of the group max), with one K scale per 16 keys on
+//                    interior tiles. 1: serves any other call, each head on its own path (per-token K scales on the
+//                    heads not flagged). Launch both on the same prologue output; the one the call flag does not
+//                    pick returns at once. One launch per call, because two launches that split the heads leave two
+//                    partly idle tails: on a real Krea2 call with 24 group heads of 48 that cost 6 %.
 //   I8PV_STRIDED  1: Q and O addressed by (row, head, batch) element strides (strided HND views and NHD).
 //   I8PV_BF16     1: bf16 Q and O; 0: fp16.
 //   I8PV_NAME     symbol prefix: I8PV_NAME_fwd and I8PV_NAME_fwd_causal.
 //
 // Inputs (from kv_prologue_i8pv): K8 (BH, N_pad, 128) int8 after the K mean, SK (BH, N_pad) its per-key scale;
 // V8T (BH, 128, N_pad) int8 of (v - vmean) / s_d / f_j, VMEAN (BH, 128); SV (BH, N_pad) holds s_d at [0, 128),
-// the tile flags at [128, 128 + nt), f_j at [128 + nt, 128 + 2 nt) and the head flag at 128 + 2 nt.
+// the tile flags at [128, 128 + nt), f_j at [128 + nt, 128 + 2 nt), the head flag at 128 + 2 nt and, in head 0's
+// row only, the call flag (every head flagged group) at 129 + 2 nt.
 // Q is quantised to int8 per token here. sm_scale must be positive (the max of scaled scores is taken as the
 // scaled max).
 //
@@ -114,8 +117,13 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   const int n_tiles = N_pad / BN;
   const int j_hi = CAUSAL ? min(n_tiles, 2 * start_m + 2) : n_tiles;
   const int full = CAUSAL ? 2 * start_m : n_tiles;
-  // the head flag is per (b, h), so a whole block leaves together
-  if ((SV[bh * N_pad + HD + 2 * n_tiles] != 0.f) != (bool)I8PV_GROUP) return;
+  // the call flag picks the object; the head flag is per (b, h), so a whole block takes one path
+#if I8PV_MIX
+  if (SV[HD + 2 * n_tiles + 1] != 0.f) return;
+  const bool head_grp = SV[bh * N_pad + HD + 2 * n_tiles] != 0.f;
+#else
+  if (SV[HD + 2 * n_tiles + 1] == 0.f) return;
+#endif
 
   // ---- Q: raw 16-bit -> int8, one scale per token ----
   qo8_t qh[8];
@@ -213,9 +221,9 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 
   // Interior tiles (every key in range, no causal mask) run a copy of the body with no skip or mask code;
   // only those take the group path.
-  auto iter = [&](auto bnd, int j) {
+  auto iter = [&](auto bnd, auto g, int j) {
     constexpr bool BND = decltype(bnd)::v;
-    constexpr bool grp = I8PV_GROUP && !BND;
+    constexpr bool grp = decltype(g)::v && !BND;
     if (j) __syncthreads();
     stage(j);
     __syncthreads();
@@ -373,8 +381,16 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
   };
   const int j_int = min(j_hi, CAUSAL ? full : N / BN);
   int j = 0;
-  for (; j < j_int; ++j) iter(btag<false>{}, j);
-  for (; j < j_hi; ++j) iter(btag<true>{}, j);
+#if I8PV_MIX
+  // only the interior loop differs between the two paths; Q, the boundary tiles and the epilogue are shared
+  if (head_grp)
+    for (; j < j_int; ++j) iter(btag<false>{}, btag<true>{}, j);
+  else
+    for (; j < j_int; ++j) iter(btag<false>{}, btag<false>{}, j);
+#else
+  for (; j < j_int; ++j) iter(btag<false>{}, btag<true>{}, j);
+#endif
+  for (; j < j_hi; ++j) iter(btag<true>{}, btag<false>{}, j);
 
   // ---- epilogue ----
 #pragma unroll

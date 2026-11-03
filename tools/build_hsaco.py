@@ -26,9 +26,9 @@ The shipped objects, one per source in `kernels/hip/`:
     attn_int8qk_f16            fp16 Q/O, int8 Q.K, contiguous HND
     attn_int8qk_f16_strided    the same with Q/O strides
     kv_prologue                the KV quantisation prologue
-    attn_i8pv_{grp,tok}_{f16,bf16}[_strided]
-                               int8 Q.K + int8 P.V; grp serves the heads kv_prologue_i8pv flags as group-safe,
-                               tok the others (one shared body, kernels/hip/attn_i8pv.h)
+    attn_i8pv_{grp,mix}_{f16,bf16}[_strided]
+                               int8 Q.K + int8 P.V; grp serves the calls whose every head kv_prologue_i8pv flags
+                               as group-safe, mix the others (one shared body, kernels/hip/attn_i8pv.h)
     kv_prologue_i8pv           the K/V quantisation for the attn_i8pv objects
     fp8_rowquant               per-token e4m3 activation quantisation and rescale for sageattention.fp8_linear
 
@@ -79,7 +79,7 @@ ARCHS = ("gfx1201", "gfx1200")
 SHIPPED = ("attn_fp8qk_f16", "attn_fp8qk_f16_strided", "attn_fp8qk_bf16", "attn_fp8qk_bf16_strided",
            "attn_int8qk_f16", "attn_int8qk_f16_strided", "kv_prologue",
            "attn_i8pv_grp_f16", "attn_i8pv_grp_f16_strided", "attn_i8pv_grp_bf16", "attn_i8pv_grp_bf16_strided",
-           "attn_i8pv_tok_f16", "attn_i8pv_tok_f16_strided", "attn_i8pv_tok_bf16", "attn_i8pv_tok_bf16_strided",
+           "attn_i8pv_mix_f16", "attn_i8pv_mix_f16_strided", "attn_i8pv_mix_bf16", "attn_i8pv_mix_bf16_strided",
            "kv_prologue_i8pv", "fp8_rowquant")
 
 

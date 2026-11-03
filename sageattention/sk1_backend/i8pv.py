@@ -1,14 +1,15 @@
-"""int8 Q.K + int8 P.V attention: `kv_prologue_i8pv` and the `attn_i8pv_{grp,tok}_{f16,bf16}[_strided]` objects
+"""int8 Q.K + int8 P.V attention: `kv_prologue_i8pv` and the `attn_i8pv_{grp,mix}_{f16,bf16}[_strided]` objects
 (sources `kernels/hip/attn_i8pv.h`, `kernels/hip/kv_prologue_i8pv.hip`).
 
 A call is two prologue launches (the K mean from ~1024 sampled rows, the V statistics from every row; then the
 quantisation) and two attention launches on the same prologue output. Per 64-key tile the prologue takes one K
 scale per 16 keys where that costs no key more than log2(1/TAU) = 2 bits, per-token scales elsewhere, and
-flags each head whose tiles all took group scales. The `grp` object serves the flagged heads (group scale and
-a seeded Q.K on interior tiles), the `tok` object the others; each returns at once for a head that is not its
-kind, so every output row is written by exactly one of them.
+flags each head whose tiles all took group scales, and the call when every head did. The `grp` object serves a
+call whose every head is flagged (group scale and a seeded Q.K on interior tiles); the `mix` object serves any
+other call, each head on its own path. The one the call flag does not pick returns at once, so the call runs as
+one launch: two launches that split the heads leave two partly idle tails.
 
-Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 129 + 2 * N_pad / 64 (N >= 129), q/k/v logical
+Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 130 + 2 * N_pad / 64 (N >= 129), q/k/v logical
 (B, H, N, D) views that `strided_view_reason` accepts.
 """
 from __future__ import annotations
@@ -60,11 +61,11 @@ class I8pv:
         self._keep = None
 
     def functions(self, dtype, strided):
-        """((grp_fwd, grp_fwd_causal), (tok_fwd, tok_fwd_causal)) for one dtype and layout."""
+        """((grp_fwd, grp_fwd_causal), (mix_fwd, mix_fwd_causal)) for one dtype and layout."""
         key = (dtype, strided)
         if key not in self._fns:
             pair = []
-            for kind in ("grp", "tok"):
+            for kind in ("grp", "mix"):
                 name = "attn_i8pv_%s_%s%s" % (kind, TAGS[dtype], "_strided" if strided else "")
                 mod = self.rt.load_module(object_path(name, self.arch))
                 pair.append((self.rt.get_function(mod, name + "_fwd"), self.rt.get_function(mod, name + "_fwd_causal")))
