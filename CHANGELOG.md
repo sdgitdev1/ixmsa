@@ -8,8 +8,9 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
 ## Unreleased (v0.6)
 
 - **New default kernels: int8 Q·K and int8 P·V** (`attn_i8pv_*`, `kv_prologue_i8pv`) for fp16 and bf16, head_dim 128,
-  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: 1.02 / 1.00 / 1.00 of its
-  time on contiguous HND and 1.02 / 0.96 / 0.96 on NHD at 4k / 8.8k / 16k tokens (fp16; bf16 the same within 1 %).
+  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: within 1–4 % either way
+  on contiguous HND (1.03 / 1.01 / 0.99 of its time at 4k / 8.8k / 16k tokens, fp16 and bf16), 0.96 of its time on
+  NHD from 8.8k tokens (counting the output copy ComfyUI makes for it) and 0.97 on MiniMax-H3's fused views.
   Against PR #368: 1.2–1.3× faster non-causal, 1.4–2.2× causal. Error on the 18 real captures: median 0.0072 in fp16
   against PR #368's 0.0126 and v0.5's 0.0139, lower than PR #368's on all 18. It uses comfy-kitchen's lazy rescale and
   kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
