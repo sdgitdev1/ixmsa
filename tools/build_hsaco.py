@@ -30,8 +30,9 @@ The shipped objects, one per source in `kernels/hip/`:
                                int8 Q.K + int8 P.V; grp serves the heads kv_prologue_i8pv flags as group-safe,
                                tok the others (one shared body, kernels/hip/attn_i8pv.h)
     kv_prologue_i8pv           the K/V quantisation for the attn_i8pv objects
+    fp8_rowquant               per-token e4m3 activation quantisation and rescale for sageattention.fp8_linear
 
-The attn_i8pv objects and kv_prologue_i8pv are built with ROCm 10.1's AMD clang 24 (SK1_ROCM_DEVEL pointing at a
+The attn_i8pv objects, kv_prologue_i8pv and fp8_rowquant are built with ROCm 10.1's AMD clang 24 (SK1_ROCM_DEVEL pointing at a
 ROCm 10.1 `_rocm_sdk_devel`), the older objects with ROCm 10.0's clang 23; `--check` needs the same compiler.
 
 No GPU is needed: the build runs with `HIP_VISIBLE_DEVICES=-1` and never initialises the runtime.
@@ -79,7 +80,7 @@ SHIPPED = ("attn_fp8qk_f16", "attn_fp8qk_f16_strided", "attn_fp8qk_bf16", "attn_
            "attn_int8qk_f16", "attn_int8qk_f16_strided", "kv_prologue",
            "attn_i8pv_grp_f16", "attn_i8pv_grp_f16_strided", "attn_i8pv_grp_bf16", "attn_i8pv_grp_bf16_strided",
            "attn_i8pv_tok_f16", "attn_i8pv_tok_f16_strided", "attn_i8pv_tok_bf16", "attn_i8pv_tok_bf16_strided",
-           "kv_prologue_i8pv")
+           "kv_prologue_i8pv", "fp8_rowquant")
 
 
 def exe(name):
