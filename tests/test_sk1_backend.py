@@ -1,7 +1,8 @@
 """Tests for the hand-written gfx1201 attention kernels, through the public `sageattn` API.
 
-On gfx1201, head_dim 128 calls are served by the prebuilt kernels by default: fp16 by the int8 Q·K
-kernel, bf16 by the bf16 fp8 kernel, with K and V quantized by the prebuilt HIP prologue. These
+On gfx1201, head_dim 128 calls are served by the prebuilt kernels by default: first by the int8 Q·K +
+int8 P·V kernels (fp16 and bf16, with their own HIP prologue), then, for a call those do not take, by the
+int8 Q·K kernel (fp16) or the bf16 fp8 kernel, with K and V quantized by the prebuilt HIP prologue. These
 tests check accuracy against fp32 SDPA, edge lengths, large V values, that NHD, HND and fused-QKV
 inputs give the same bits, the prologue, the environment switches and the fallback. They are
 skipped when there is no gfx1201 GPU or no HIP runtime.
@@ -186,7 +187,7 @@ def test_hip_prologue_is_the_default():
     assert hp is not None
     before = hp.n_calls
     q, k, v = _rand_qkv(1, 8, 512, seed=21)
-    _sageattn()(q, k, v, tensor_layout="HND")
+    _sageattn()(q, k, v, tensor_layout="HND", sk1_i8pv=False)
     assert hp.n_calls > before
 
 
@@ -284,3 +285,56 @@ def test_default_path_does_not_import_triton():
         print("RESULT", "triton" in sys.modules)
     """
     assert _run_fresh(code, SAGEATTN_SK1_PROLOGUE="hip", SAGEATTN_CK="0") == ["False"]
+
+
+# ---- the int8 Q.K + int8 P.V objects (attn_i8pv_*), served first for head_dim 128 ----
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("causal", [False, True])
+def test_i8pv_serves_the_default_call(causal, dtype):
+    q, k, v = _rand_qkv(1, 8, 1000, seed=3, dtype=dtype)
+    sa = _sageattn()
+    out = sa(q, k, v, tensor_layout="HND", is_causal=causal)
+    assert torch.equal(out, sa(q, k, v, tensor_layout="HND", is_causal=causal, sk1_i8pv=True))
+    assert not torch.equal(out, sa(q, k, v, tensor_layout="HND", is_causal=causal, sk1_i8pv=False))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("causal", [False, True])
+def test_i8pv_is_more_accurate_than_fp8_pv(causal, dtype):
+    # half the heads get a few extreme keys, so both the group-K and the per-token-K object serve the call
+    q, k, v = _rand_qkv(1, 8, 2048, seed=5, dtype=dtype)
+    k[:, :4, ::97] *= 25
+    ref = _reference(q, k, v, causal)
+    sa = _sageattn()
+    new = sa(q, k, v, tensor_layout="HND", is_causal=causal)
+    old = sa(q, k, v, tensor_layout="HND", is_causal=causal, sk1_i8pv=False)
+    assert torch.isfinite(new).all()
+    assert _rel_rms(new, ref) < 0.8 * _rel_rms(old, ref)
+
+
+@pytest.mark.parametrize("n, scale, head_dim", [(100, None, 128), (1000, -0.05, 128), (1000, None, 64)])
+def test_i8pv_refusals_fall_back(n, scale, head_dim):
+    # fewer than 135 tokens, a negative scale and head_dim 64 go to the previous objects
+    q, k, v = _rand_qkv(1, 4, n, seed=7, head_dim=head_dim)
+    sa = _sageattn()
+    out = sa(q, k, v, tensor_layout="HND", sm_scale=scale)
+    assert torch.equal(out, sa(q, k, v, tensor_layout="HND", sm_scale=scale, sk1_i8pv=False))
+
+
+def test_i8pv_strict_raises_on_a_refusal():
+    q, k, v = _rand_qkv(1, 4, 100, seed=7)
+    with pytest.raises(RuntimeError):
+        _sageattn()(q, k, v, tensor_layout="HND", sk1_i8pv=True)
+
+
+def test_i8pv_switch_off():
+    code = """
+        import torch
+        from sageattention import sageattn
+        g = torch.Generator(device="cuda").manual_seed(0)
+        q, k, v = [torch.randn(1, 8, 512, 128, device="cuda", dtype=torch.float16, generator=g)
+                   for _ in range(3)]
+        print("RESULT", torch.equal(sageattn(q, k, v), sageattn(q, k, v, sk1_i8pv=False)))
+    """
+    assert _run_fresh(code, SAGEATTN_SK1_I8PV="0") == ["True"]

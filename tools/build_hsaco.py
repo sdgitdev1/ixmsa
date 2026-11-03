@@ -26,6 +26,13 @@ The shipped objects, one per source in `kernels/hip/`:
     attn_int8qk_f16            fp16 Q/O, int8 Q.K, contiguous HND
     attn_int8qk_f16_strided    the same with Q/O strides
     kv_prologue                the KV quantisation prologue
+    attn_i8pv_{grp,tok}_{f16,bf16}[_strided]
+                               int8 Q.K + int8 P.V; grp serves the heads kv_prologue_i8pv flags as group-safe,
+                               tok the others (one shared body, kernels/hip/attn_i8pv.h)
+    kv_prologue_i8pv           the K/V quantisation for the attn_i8pv objects
+
+The attn_i8pv objects and kv_prologue_i8pv are built with ROCm 10.1's AMD clang 24 (SK1_ROCM_DEVEL pointing at a
+ROCm 10.1 `_rocm_sdk_devel`), the older objects with ROCm 10.0's clang 23; `--check` needs the same compiler.
 
 No GPU is needed: the build runs with `HIP_VISIBLE_DEVICES=-1` and never initialises the runtime.
 
@@ -69,7 +76,10 @@ KERNEL_DIR = os.path.join(ROOT, "kernels", "hip")
 PACKAGE_DIR = os.path.join(ROOT, "sageattention", "sk1_backend")
 ARCHS = ("gfx1201", "gfx1200")
 SHIPPED = ("attn_fp8qk_f16", "attn_fp8qk_f16_strided", "attn_fp8qk_bf16", "attn_fp8qk_bf16_strided",
-           "attn_int8qk_f16", "attn_int8qk_f16_strided", "kv_prologue")
+           "attn_int8qk_f16", "attn_int8qk_f16_strided", "kv_prologue",
+           "attn_i8pv_grp_f16", "attn_i8pv_grp_f16_strided", "attn_i8pv_grp_bf16", "attn_i8pv_grp_bf16_strided",
+           "attn_i8pv_tok_f16", "attn_i8pv_tok_f16_strided", "attn_i8pv_tok_bf16", "attn_i8pv_tok_bf16_strided",
+           "kv_prologue_i8pv")
 
 
 def exe(name):

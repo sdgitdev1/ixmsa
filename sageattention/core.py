@@ -1061,6 +1061,7 @@ def sageattn(
     sk1_backend: Optional[bool] = None,
     sk1_int8: Optional[bool] = None,
     sk1_bf16: Optional[bool] = None,
+    sk1_i8pv: Optional[bool] = None,
     **kwargs: Any,
 ):
     """
@@ -1159,6 +1160,13 @@ def sageattn(
         D=64 call with bf16 on is refused (``bf16_d128_only``).  The fp16 path is untouched: the
         bf16 objects are the same kernel source with the Q/O element type templated, and the fp16
         instantiation in them is instruction-identical to the shipped object.
+
+    sk1_i8pv : Optional[bool]
+        Serve the call with the int8 Q.K + int8 P.V objects (``attn_i8pv_*``) first.  Default ON.
+        ``None`` reads ``SAGEATTN_SK1_I8PV`` (unset: on, falling back to the objects above for a call they
+        do not take: head_dim 64, ``sm_scale <= 0``, fewer than 135 tokens, or a failure).  ``False``
+        skips them for this call; ``True`` is strict (a call they cannot serve raises).  An fp16 call
+        with ``sk1_int8=False`` asked for fp8 Q.K and skips them too.
     """
         
     arch = get_cuda_arch_versions()[q.device.index]
@@ -1226,6 +1234,7 @@ def sageattn(
                     strict=_sk1_strict,
                     int8=_sk1_i8,
                     bf16=sk1_bf16,
+                    i8pv=sk1_i8pv,
                 )
                 if _sk1_out is not None:
                     return _sk1_out

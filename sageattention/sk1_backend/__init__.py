@@ -15,6 +15,8 @@ self-contained `elf64-amdgpu` file with no C++ imports, so the `c10` ABI mismatc
 * `attn_fp8qk_bf16` / `attn_fp8qk_bf16_strided`: the fp8 kernels with a bf16 Q/O element type.
   bf16, head_dim 128, used by default for bf16 input.
 * `kv_prologue`: the HIP KV prologue (`kernels/hip/kv_prologue.hip`), used by default.
+* `attn_i8pv_*` + `kv_prologue_i8pv` (`i8pv.py`): int8 Q.K and int8 P.V, fp16 and bf16, head_dim 128, every
+  layout above, causal or not. Used first by default; a call it does not take goes to the objects above.
 
 No object serves head_dim 64: those calls fall back to the shipped path.
 
@@ -34,6 +36,9 @@ Environment variables (read once, at import):
   normally. `0` sends bf16 calls to the shipped path (reason `"dtype"`). `1` is strict.
 * `SAGEATTN_SK1_PROLOGUE`: unset or `hip` quantises K and V with the HIP prologue, falling back to
   the Triton prologue for a call it cannot serve. `triton` uses the Triton prologue only.
+* `SAGEATTN_SK1_I8PV`: unset serves fp16/bf16 head_dim-128 calls with a positive scale and N >= 135 with the
+  int8 P.V objects and falls back to the objects above for anything else or on a failure. `0` turns them off.
+  `1` is strict: a call they cannot serve raises.
 * `SAGEATTN_SK1_GFX1200=1`: lets a gfx1200 device use the `*.gfx1200.hsaco` objects (the same
   kernels built with `--offload-arch=gfx1200`). Unset, a gfx1200 device is refused (reason
   `"arch"`). No effect on gfx1201.
@@ -193,6 +198,10 @@ else:
     SK1_BF16 = bool(SK1_BF16_DEFAULT_ON)
     SK1_BF16_STRICT = False
 
+_sk1_v_env = os.environ.get("SAGEATTN_SK1_I8PV", "").strip().lower()
+SK1_I8PV = _sk1_v_env not in ("0", "false", "no", "off")
+SK1_I8PV_STRICT = _sk1_v_env in ("1", "true", "yes", "on")
+
 #: The arches a packaged code object exists for (prefix test, so `gfx1201:sramecc-:xnack-` matches).
 #: Membership means "an object set exists", not "this device is served"; that is `selected_arch()`.
 SUPPORTED_ARCHS = ("gfx1201", "gfx1200")
@@ -228,6 +237,8 @@ _BACKEND_B_FAILED = None
 _BACKEND_BN = None
 _BACKEND_BN_FAILED = None
 _LOGGED = False
+#: arch -> loaded `i8pv.I8pv`, or the exception its load raised
+_I8PV = {}
 #: `sk1_loader.strided_view_reason`, imported once on first use: `_envelope_ok` runs the guard three
 #: times per attention call, so the import stays off the hot path.
 _SVR = None
@@ -545,6 +556,43 @@ def _load_i8n(arch=None):
         return None
 
 
+def _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm, smooth_k, arch, strict):
+    """`(out, None)` from the int8 P.V objects, or `(None, reason)` for the caller to fall through. Raises
+    only when `strict`."""
+    from . import i8pv
+    why = i8pv.refusal(qq, sm)
+    if why is not None:
+        if strict:
+            raise RuntimeError("the int8 P.V objects cannot serve this call (%s)" % why)
+        return None, why
+    try:
+        v = _I8PV.get(arch)
+        if v is None:
+            v = _I8PV[arch] = i8pv.I8pv(arch)
+        elif isinstance(v, Exception):
+            raise v
+        import torch
+        B, H, N, D = qq.shape
+        if contiguous_hnd:
+            out = torch.empty(B * H, N, D, device=qq.device, dtype=qq.dtype)
+            v.run(qq, kk, vv, out, bool(is_causal), sm, smooth_k, True)
+            return out.view(B, H, N, D), None
+        if tensor_layout == "NHD":
+            out = torch.empty(B, N, H, D, device=qq.device, dtype=qq.dtype)
+            v.run(qq, kk, vv, out.transpose(1, 2), bool(is_causal), sm, smooth_k, False)
+        else:
+            out = torch.empty(B, H, N, D, device=qq.device, dtype=qq.dtype)
+            v.run(qq, kk, vv, out, bool(is_causal), sm, smooth_k, False)
+        return out, None
+    except Exception as e:                                          # noqa: BLE001
+        if arch not in _I8PV:
+            _I8PV[arch] = e
+        if strict:
+            raise
+        _log_once("int8 P.V path failed, using the previous SK1 objects: %s" % e)
+        return None, "i8pv_failed"
+
+
 def int8_status() -> dict:
     """The state of the two int8 objects without loading anything. Never raises.
 
@@ -699,7 +747,8 @@ def _envelope_ok(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, smooth
 
 
 def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, return_lse=False,
-               smooth_k=True, smooth_v=False, attn_mask=None, strict=False, int8=None, bf16=None):
+               smooth_k=True, smooth_v=False, attn_mask=None, strict=False, int8=None, bf16=None,
+               i8pv=None):
     """Run the prebuilt SK1 kernel if the call is inside `ENVELOPE` and the platform supports it.
 
     Returns `(out, reason)` where `out` is the attention output in the caller's (B,H,N,D) shape, or
@@ -770,6 +819,15 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                 % (SK1_HSACO_NAME_B, SK1_HSACO_NAME_BN))
         _log_once("bf16 object is head_dim 128 only (head_dim=64)")
         return None, "bf16_d128_only"
+    # The int8 P.V objects first; a call they do not take continues to the objects below. An fp16 call with int8
+    # off (`int8=False` / `SAGEATTN_SK1_INT8=0`) asked for the fp8 Q.K objects, so it skips them.
+    want_v = bool(SK1_I8PV) if i8pv is None else bool(i8pv)
+    if want_v and not d64 and (is_bf16 or (bool(SK1_INT8) if int8 is None else bool(int8))):
+        sm_v = float(sm_scale if sm_scale is not None else qq.size(3) ** -0.5)
+        out, _ = _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm_v, bool(smooth_k), _arch,
+                           SK1_I8PV_STRICT if i8pv is None else bool(i8pv))
+        if out is not None:
+            return out, None
     if int8 is None:
         want_i8, i8_strict = bool(SK1_INT8), bool(SK1_INT8_STRICT)
     else:

@@ -462,7 +462,7 @@ class Sk1Attn:
 
     @staticmethod
     def _check_strided(q, k8, sk, v8t, sv, vmean, out, H, N, N_pad, s=None, head_dim=128,
-                       qo_dtype=None):
+                       qo_dtype=None, with_s=True):
         """`_check` for the 18-argument object.
 
         Same contract, except `q` and `out` are logical `(B, H, N, D)` tensors that may be strided
@@ -471,7 +471,7 @@ class Sk1Attn:
         """
         import torch
         qo_dtype = torch.float16 if qo_dtype is None else qo_dtype
-        if s is None:
+        if with_s and s is None:
             raise ValueError("this SK1 object takes the per-head V scale `S` argument; s=None was passed")
         N, N_pad, H = int(N), int(N_pad), int(H)
         head_dim = int(head_dim)
@@ -530,10 +530,11 @@ class Sk1Attn:
                                  % (bh, head_dim, tuple(vmean.shape), vmean.dtype))
             if not vmean.is_cuda or not vmean.is_contiguous() or vmean.device != q.device:
                 raise ValueError("vmean must be a contiguous device tensor on q's device")
-        if tuple(s.shape) != (bh,) or s.dtype != torch.float32:
-            raise ValueError("s must be (%d,) fp32; got %s %s" % (bh, tuple(s.shape), s.dtype))
-        if not s.is_cuda or not s.is_contiguous() or s.device != q.device:
-            raise ValueError("s must be a contiguous device tensor on q's device")
+        if with_s:
+            if tuple(s.shape) != (bh,) or s.dtype != torch.float32:
+                raise ValueError("s must be (%d,) fp32; got %s %s" % (bh, tuple(s.shape), s.dtype))
+            if not s.is_cuda or not s.is_contiguous() or s.device != q.device:
+                raise ValueError("s must be a contiguous device tensor on q's device")
         return qtr, otr
 
     def launch(self, q, k8, sk, v8t, sv, vmean, out, H, N, N_pad, sm_scale, causal,
@@ -571,7 +572,8 @@ class Sk1Attn:
             raise ValueError("this SK1 object is not the strided form (symbols=%r)"
                              % (self.symbols,))
         qtr, otr = self._check_strided(q, k8, sk, v8t, sv, vmean, out, H, N, N_pad, s=s,
-                                       head_dim=self.head_dim, qo_dtype=self.qo_dtype)
+                                       head_dim=self.head_dim, qo_dtype=self.qo_dtype,
+                                       with_s=self.with_s)
         c = ctypes
         args = [c.c_void_p(q.data_ptr()), c.c_void_p(k8.data_ptr()), c.c_void_p(sk.data_ptr()),
                 c.c_void_p(v8t.data_ptr()), c.c_void_p(sv.data_ptr()),
