@@ -16,9 +16,9 @@ ComfyUI users get it through the normal `--use-sage-attention` switch. No node a
 is needed.
 
 ComfyUI also has its own int8 attention for this card, `--use-ck-attention` (comfy-kitchen). v0.6
-is level with it on contiguous inputs (within a few percent either way), 3–4 % faster on the strided
-NHD and fused-QKV inputs most models pass, and more accurate on layers with extreme keys. It has a
-causal mode, which comfy-kitchen does not (see "Compared with comfy-kitchen" below).
+is 1–2 % faster than it on contiguous inputs, up to 6 % faster on the strided NHD and fused-QKV
+inputs most models pass, and more accurate on layers with extreme keys. It has a causal mode, which
+comfy-kitchen does not (see "Compared with comfy-kitchen" below).
 
 ---
 
@@ -142,11 +142,11 @@ non-causal):
 
 | | N = 4 096 | 8 771 | 16 384 |
 |---|---|---|---|
-| fp16, contiguous HND | 0.97 | 0.99 | 1.01 |
-| bf16, contiguous HND | 0.96 | 0.99 | 1.01 |
-| fp16, NHD as ComfyUI passes it | 0.98 | 1.04 | 1.04 |
+| fp16, contiguous HND | 1.01 | 1.02 | 1.02 |
+| bf16, contiguous HND | 1.01 | 1.01 | 1.02 |
+| fp16, NHD as ComfyUI passes it | 1.00 | 1.06 | 1.04 |
 
-MiniMax-H3's fused-QKV views, bf16, H=56: 1.03 at N = 27 280, 31 248 and 61 488. For NHD input
+MiniMax-H3's fused-QKV views, bf16, H=56: 1.04 / 1.04 / 1.03 at N = 27 280 / 31 248 / 61 488. For NHD input
 ComfyUI hands comfy-kitchen transposed views and copies its HND output back into NHD, and that copy
 is counted. comfy-kitchen has no causal mode. Error: see Accuracy above.
 
@@ -257,6 +257,17 @@ tensor_layout=...)` directly: it returns `(None, reason)` for a call it refuses.
 
 If the kernels cannot be used at all, for example on a different GPU, the package logs one line
 per process and carries on with the fallback.
+
+### fp8 linear layers
+
+v0.6 also ships `sageattention.fp8_linear.linear(x, w8, w_scale, bias=None)`: `x @ (w8 * w_scale)^T`
+for fp16 or bf16 `x` and an e4m3 weight with one scale, computed in fp8 with one activation scale per
+token. It is meant for the layers fp8_scaled checkpoints mark `full_precision_matrix_mult` (96 in
+Krea2 Turbo), which ComfyUI otherwise runs as dequantize + fp16 GEMM. At Krea2's shapes it takes
+0.61–0.70× the time of that path, with the error of the checkpoint's other fp8 layers (F175); a Krea2
+step at 1672×1256 goes from 2.38 s to 2.12 s. Neither `sageattn` nor ComfyUI calls it on its own: a
+node or patch has to route those layers to it. A call it does not take (other dtypes, a per-channel
+scale, K or N not a multiple of 16, K over 32 768, no code object for the GPU) returns `None`.
 
 ## Build from source
 

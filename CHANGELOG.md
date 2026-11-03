@@ -8,13 +8,20 @@ summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them
 ## Unreleased (v0.6)
 
 - **New default kernels: int8 Q·K and int8 P·V** (`attn_i8pv_*`, `kv_prologue_i8pv`) for fp16 and bf16, head_dim 128,
-  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: within 1–4 % either way
-  on contiguous HND (1.03 / 1.01 / 0.99 of its time at 4k / 8.8k / 16k tokens, fp16 and bf16), 0.96 of its time on
-  NHD from 8.8k tokens (counting the output copy ComfyUI makes for it) and 0.97 on MiniMax-H3's fused views.
+  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: 0.98–0.99 of its time
+  on contiguous HND (fp16 and bf16, 4k to 16k tokens), 0.95–1.00 on NHD (counting the output copy ComfyUI makes for
+  it) and 0.96–0.97 on MiniMax-H3's fused views.
   Against PR #368: 1.2–1.3× faster non-causal, 1.4–2.2× causal. Error on the 18 real captures: median 0.0072 in fp16
   against PR #368's 0.0126 and v0.5's 0.0139, lower than PR #368's on all 18. It uses comfy-kitchen's lazy rescale and
   kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
   others, which keeps Krea2's outlier layers accurate), and a seeded Q·K accumulator (F174). bf16 now uses int8 Q·K too.
+- Their K/V statistics take one launch: V is read in full, the K mean comes from about 1024 sampled rows. Error on the
+  18 captures is unchanged.
+- **`sageattention.fp8_linear`**: an fp8 e4m3 linear with one activation scale per token (HIP quantize,
+  `torch._scaled_mm`, HIP rescale; object `fp8_rowquant`), for the layers fp8_scaled checkpoints keep at full
+  precision. 0.61–0.70× the time of dequantize + fp16 GEMM at Krea2's shapes, with the error of the checkpoint's other
+  fp8 layers; a Krea2 step at 1672×1256 goes from 2.38 s to 2.12 s when a node routes those layers to it (F175).
+  `sageattn` does not use it.
 - `SAGEATTN_SK1_I8PV=0` (or `sageattn(..., sk1_i8pv=False)`) turns the new kernels off; `SAGEATTN_SK1_INT8=0` does too
   for fp16. head_dim 64, fewer than 129 tokens and `sm_scale <= 0` keep the previous objects.
 - **`SAGEATTN_CK=1`** hands non-causal head_dim 128 calls to comfy-kitchen's int8 attention when it
