@@ -71,8 +71,8 @@ class I8pv:
             self._fns[key] = tuple(pair)
         return self._fns[key]
 
-    def prologue(self, k, v, smooth_k):
-        """k, v: logical (B, H, N, 128) views. Returns k8, sk, v8t, sv, vmean, n_pad."""
+    def prologue(self, k, v, smooth_k, st):
+        """k, v: logical (B, H, N, 128) views; st: the stream handle. Returns k8, sk, v8t, sv, vmean, n_pad."""
         B, H, N, D = (int(x) for x in k.shape)
         BH = B * H
         n_pad = (N + BN - 1) // BN * BN
@@ -91,7 +91,6 @@ class I8pv:
         a3 = [P(k.data_ptr()), P(v.data_ptr()), P(k8.data_ptr()), P(sk.data_ptr()), P(v8t.data_ptr()),
               P(sv.data_ptr()), P(kmean.data_ptr()), P(vmean.data_ptr()), I64(N), I64(n_pad), I64(H)] + strides + \
             [ctypes.c_float(1e-12), ctypes.c_int(1 if smooth_k else 0), ctypes.c_float(TAU)]
-        st = torch_stream()
         launches = [self.rt.launch(self.f_stats[k.dtype], (BH, 1, 1), (256, 1, 1), 0, st, a1),
                     self.rt.launch(self.f_quant[k.dtype], (n_pad // BN, BH, 1), (256, 1, 1), 0, st, a3)]
         self._keep_pro = (a1, a3, launches)
@@ -103,13 +102,13 @@ class I8pv:
         `out` is written in place. Both objects take the same arguments, so they are built once."""
         B, H, N, D = (int(x) for x in qq.shape)
         fns = self.functions(qq.dtype, not contiguous_hnd)   # load (or fail) before any prologue work
-        k8, sk, v8t, sv, vmean, n_pad = self.prologue(kk, vv, smooth_k)
+        st = torch_stream()
+        k8, sk, v8t, sv, vmean, n_pad = self.prologue(kk, vv, smooth_k, st)
         P, I = ctypes.c_void_p, ctypes.c_int
         args = [P(qq.data_ptr()), P(k8.data_ptr()), P(sk.data_ptr()), P(v8t.data_ptr()), P(sv.data_ptr()),
                 P(vmean.data_ptr()), P(out.data_ptr()), I(H), I(N), I(n_pad), ctypes.c_float(float(sm_scale))]
         if not contiguous_hnd:
             args += [I(x) for x in _strided_triple(qq, "q")[:3] + _strided_triple(out, "out")[:3]]
-        st = torch_stream()
         grid = ((N + 127) // 128, H, B)
         launches = [self.rt.launch(f[1] if causal else f[0], grid, (256, 1, 1), 0, st, args)
                     for f in fns]

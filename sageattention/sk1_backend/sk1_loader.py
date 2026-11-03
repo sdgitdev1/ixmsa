@@ -264,7 +264,7 @@ class HipRuntime:
         HIP dereferences `kernelParams` asynchronously, so both the pointer array and the values
         must outlive the launch. They are kept in `self._keepalive` as well as returned.
         """
-        vals = [ctypes.cast(ctypes.byref(v), ctypes.c_void_p) for v in args]
+        vals = [ctypes.addressof(v) for v in args]
         arr = (ctypes.c_void_p * len(vals))(*vals)
         rc = self.hip.hipModuleLaunchKernel(fn, *[ctypes.c_uint(x) for x in grid],
                                             *[ctypes.c_uint(x) for x in block],
