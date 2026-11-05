@@ -1633,7 +1633,7 @@ Error against the fp32 product on the inputs captured from a Krea2 render (block
 
 End to end (Krea2 Turbo fp8_scaled, 1672×1256, 8 steps, v0.6 attention, the layers routed by a patch node; 768 calls served per render, none refused): 2.38 / 2.36 s per step without, 2.12 / 2.12 with; a later interleaved pair gave 2.43 / 2.47 against 2.14 / 2.12.
 
-A review before release found three defects, each fixed with a test: the rescale pass put the rows on the grid's y axis, which stops at 65535, so from 65536 tokens (video models) the remaining rows were left unscaled (relative error 0.71 at 70000 rows, no error raised); a NaN in x came out as finite values, because `fminf` / `fmaxf` clamped it to −448; and an input that needs a gradient came back detached. Rows are now on x, the clamp keeps NaN, and calls autograd has to see through return `None`. The code object is also loaded per device rather than per architecture. The Krea2 latent is bit-identical before and after.
+Testing before release found three defects, each fixed with a test: the rescale pass put the rows on the grid's y axis, which stops at 65535, so from 65536 tokens (video models) the remaining rows were left unscaled (relative error 0.71 at 70000 rows, no error raised); a NaN in x came out as finite values, because `fminf` / `fmaxf` clamped it to −448; and an input that needs a gradient came back detached. Rows are now on x, the clamp keeps NaN, and calls autograd has to see through return `None`. The code object is also loaded per device rather than per architecture. The Krea2 latent is bit-identical before and after.
 
 **Status:** v0.6, `sageattention.fp8_linear` (object `fp8_rowquant`). A library function: `sageattn` does not call it.
 
@@ -1646,3 +1646,37 @@ A review before release found three defects, each fixed with a test: the rescale
 Subtracting the per-head key mean is exact: it moves every score of a row by the same constant, which softmax ignores. So `sageattn` on gfx12 now always smooths K, on every path including PR #368's; `smooth_k=False` is accepted and gives the same bits as `True`, and K is not modified in place.
 
 **Status:** v0.6.0.
+
+### F177 — One launch per call, and the K scale path chosen per tile <sub>(v0.6)</sub>
+
+**Question.** F174's kernels picked the K scale per head and launched two objects, one for group-scale heads and one for per-token heads. On Krea2's real calls, where some layers have half their heads on per-token scales, comfy-kitchen was still 3–6 % faster per call. Where does that go?
+
+**Result.** Two launches that split the heads cost about 6 % in tails: each launch ends with a partly idle GPU. Two streams did not overlap them. Now the prologue writes one call flag (in head 0's statistics row, set when every tile of every head took group scales), and one launch serves the call: the group object for all-group calls, a mixed object otherwise. The mixed object picks the path per 64-key tile from the tile flags the prologue already wrote. A plain branch between the two paths spilled 34–70 registers. What fits is a shared register set: the per-token path writes its scaled fp32 scores into the registers the seeded group path uses, so the exponent step is one code path, `exp2(fma(bits, a, c))`, with a and c chosen per tile (182 VGPR, no spills). The group objects are byte-identical to F174's.
+
+comfy-kitchen's time over this package's on real Krea2 calls (8 771 tokens, fp16): a call with 24 of 48 heads on per-token scales 0.939 → 1.002, block 15 (4 such heads) 0.970 → 1.014, all-group blocks 1.012–1.020 (unchanged). Error on the 18 captures is unchanged (fp16 median 0.0072, 18/18 below PR #368).
+
+Not adopted: the seeded group path for per-token tiles as well, with −1.5·2²³ times each key's scale stored in LDS (1–2 % slower); a looser group threshold, a quarter of the group max down to an eighth (0.6 % faster, Krea2 block 0 error 3× higher).
+
+Knockouts of the group kernel at (1, 48, 8462, 128): without the Q·K WMMAs it takes 28 % less time, without the P·V WMMAs 25 %, without the exponentials 9 %, without staging 5 %. Per tile and wave that is 64 WMMAs (about 512 cycles) plus about 260 VALU and transcendental instructions, about 900 cycles, which matches the measured time: the kernel is issue-bound, because WMMA and VALU share the issue port on RDNA4. A sweep of scheduling fences and occupancy found nothing faster (dropping one fence +0.1–0.5 %, fences per block +2.2 %, 6 waves per SIMD +2.7 %, 4 waves +10.5 %). Further speed would have to come from fewer instructions per tile, which means coarser quantization.
+
+**Status:** v0.6.0.
+
+### F178 — CPU cost per call, and the first call in a render <sub>(v0.6)</sub>
+
+**Question.** Short calls of a few hundred tokens were 1–17 % slower than comfy-kitchen's back to back, and in a ComfyUI render the first long call took ~93 ms against comfy-kitchen's 20–27 ms. Both are outside the kernel.
+
+**Result.** Each launch packed its arguments by building ctypes pointer arrays and looked up the stream twice. With the argument addresses taken once and one stream lookup per call, the CPU cost of a call drops from about 100 to 72 µs, and comfy-kitchen's time over this package's on the real 288–1 056-token captures goes from 0.83–0.99 to 1.07–1.17.
+
+The first call in a render loads the code objects, and each load resolved the ROCm runtime's folder by enumerating every module loaded in the process: about 40 ms in ComfyUI, which loads hundreds. The folder is now looked up once, from the runtime module torch has already loaded (`GetModuleHandleW`), and the check that it is the same runtime as torch's runs only when read. The first long call in a Krea2 render drops from 93 to 4–6 ms; a first call in a fresh process spends 99 ms of CPU (was 265), most of it in torch's own first-use kernels.
+
+__F178_RENDER__
+
+**Status:** v0.6.0.
+
+### F179 — The Fastpath node's fp8 GEMM against comfy-kitchen's own <sub>(v0.6)</sub>
+
+**Question.** The ComfyUI node in `comfyui/` was written when comfy-kitchen turned its fp8 matmul off on HIP. From 0.2.25 comfy-kitchen has its own HIP fp8 kernel. The node replaces it with hipBLASLt (legacy `torch._scaled_mm`). Is that still faster?
+
+**Result.** Called as comfy-kitchen's fp8 linear calls it (x contiguous, the weight as a transposed view, bf16 out), comfy-kitchen 0.2.41, interleaved: at M = 8462 the hipBLASLt time over comfy-kitchen's is 0.79 / 0.79 / 0.76 for K × N = 6144 × 6144, 6144 × 18432 and 6144 × 16384 (~228 against ~180 TFLOPS); at M = 4096 0.79–0.91 for K from 3072 to 14336, and at M = 512 0.78–0.97. The exception is K = 16384: 1.12–1.82× slower (100–116 TFLOPS, the shape F175 splits in two), and K = 24576 is 1.07× slower, while K = 20480 is 0.89×. The two agree to 3·10⁻⁵ relative. The node now sends calls with K ≥ 16384 to comfy-kitchen's kernel and the rest to hipBLASLt. Krea2 Turbo's only K = 16384 layers are its full-precision `mlp.down`, which the node routes to `fp8_linear` (F175) anyway; the split matters for checkpoints that quantize those layers, or with `COMFYUI_FP8_UNIFORM_QUANT=1`.
+
+**Status:** v0.6.0, `comfyui/ComfyUI-ROCm-FP8-Fastpath`.
