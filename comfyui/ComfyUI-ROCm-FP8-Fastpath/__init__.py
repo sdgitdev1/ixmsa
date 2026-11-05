@@ -34,6 +34,7 @@ Per-token fp8 (3.) on Krea 2 Turbo fp8_scaled, 1672x1256, RX 9070 XT:
 Only active when torch.version.hip is set; no-op on NVIDIA/CPU.
 """
 
+import inspect
 import logging
 
 NODE_CLASS_MAPPINGS = {}
@@ -134,6 +135,7 @@ def _apply():
         register_layout_op(torch.ops.aten.mm.default, layout)(better_mm)
         register_layout_op(torch.ops.aten.addmm.default, layout)(better_addmm)
         register_layout_op(torch.ops.aten.linear.default, layout)(better_linear)
+    parts = ["hipblaslt-gemm", "stride-aware-dequant"]
 
     # 4) OPT-IN uniform-quant mode (set COMFYUI_FP8_UNIFORM_QUANT=1): fp8-scaled
     #    checkpoints mark some layers "full_precision_matrix_mult" (quality
@@ -159,19 +161,22 @@ def _apply():
             return r
 
         _cops._load_quantized_module = _uniform_lqm
-        log.info("[ROCm-FP8-Fastpath] UNIFORM-QUANT mode ON: full-precision-marked fp8 layers forced onto the fp8 fast path")
+        parts.append("uniform-quant")
 
     # 5) per-token fp8 for the checkpoint's full-precision e4m3 layers in diffusion models (pick_operations; text
     #    encoders build their ops elsewhere and keep dequantize + GEMM). On by default, COMFYUI_FP8_PERTOKEN=0 turns
     #    it off; fp8_linear.linear returns None for calls it does not take, which keep ComfyUI's path.
     elif os.environ.get("COMFYUI_FP8_PERTOKEN", "1") != "0":
+        import comfy.ops as _cops
         try:
             from sageattention import fp8_linear
         except ImportError:
             fp8_linear = None
-            log.info("[ROCm-FP8-Fastpath] per-token fp8 for full-precision layers needs SageAttention-RDNA4 0.6 or later")
-        if fp8_linear is not None:
-            import comfy.ops as _cops
+            log.info("[ROCm-FP8-Fastpath] per-token-fp8 skipped: needs SageAttention-RDNA4 0.6 or later")
+        changed = _pertoken_interface_change(_cops)
+        if changed:
+            log.warning("[ROCm-FP8-Fastpath] per-token-fp8 skipped: ComfyUI's fp8 Linear changed (%s)", changed)
+        elif fp8_linear is not None:
             _orig_pick = _cops.pick_operations
 
             def _pertoken_pick(*args, **kwargs):
@@ -196,9 +201,19 @@ def _apply():
                 return ops
 
             _cops.pick_operations = _pertoken_pick
-            log.info("[ROCm-FP8-Fastpath] per-token fp8 ON for full-precision fp8 layers (COMFYUI_FP8_PERTOKEN=0 turns it off)")
+            parts.append("per-token-fp8")
 
-    log.info("[ROCm-FP8-Fastpath] ACTIVE: fp8 fast matmul via legacy _scaled_mm + stride-aware dequant fallback")
+    log.info("[ROCm-FP8-Fastpath] ACTIVE: %s", ", ".join(parts))
+
+
+def _pertoken_interface_change(cops):
+    """What section 5 relies on in comfy.ops and is missing, or "" when all of it is there."""
+    for name in ("CastBiasWeightContext", "MixedPrecisionOp", "mixed_precision_ops", "pick_operations"):
+        if not hasattr(cops, name):
+            return "no comfy.ops." + name
+    if "weight_only_quant" not in inspect.signature(cops.mixed_precision_ops().Linear.forward_comfy_cast_weights).parameters:
+        return "forward_comfy_cast_weights has no weight_only_quant"
+    return ""
 
 
 try:
