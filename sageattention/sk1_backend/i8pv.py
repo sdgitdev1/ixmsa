@@ -9,8 +9,9 @@ seeded Q.K on interior tiles); the `mix` object serves any other call, each inte
 names. The one the call flag does not pick returns at once, so the call runs as one launch: two launches that
 split a call's heads leave two partly idle tails.
 
-Contract: fp16 or bf16, head_dim 128, sm_scale > 0, N_pad >= 129 + 2 * N_pad / 64 (N >= 129), q/k/v logical
-(B, H, N, D) views that `strided_view_reason` accepts.
+Contract: fp16 or bf16, head_dim 128, sm_scale > 0, q a logical (B, H, Nq, D) view and k/v (B, H, Nk, D) views
+that `strided_view_reason` accepts, N_pad >= 129 + 2 * N_pad / 64 for N_pad = Nk rounded up to 64 (Nk >= 129), and
+Nq == Nk for a causal call. Nq may be anything from 1.
 """
 from __future__ import annotations
 
@@ -33,16 +34,16 @@ def object_path(name, arch):
     return os.path.join(HERE, "%s.%s.hsaco" % (name, arch or "gfx1201"))
 
 
-def refusal(q, sm_scale):
-    """`None` if the call is inside the contract above (layout and strides are checked by the caller's envelope),
-    else the reason."""
+def refusal(q, k, sm_scale):
+    """`None` if the call is inside the contract above (layout, strides and the causal length rule are checked by
+    the caller's envelope), else the reason."""
     if q.dtype not in TAGS:
         return "i8pv_dtype"
     if q.size(-1) != HD:
         return "i8pv_head_dim"
     if not sm_scale > 0:
         return "i8pv_scale"
-    n_pad = (int(q.size(2)) + BN - 1) // BN * BN
+    n_pad = (int(k.size(2)) + BN - 1) // BN * BN
     if n_pad < HD + 2 * (n_pad // BN) + 1:
         return "i8pv_short"
     return None
@@ -98,19 +99,21 @@ class I8pv:
         return k8, sk, v8t, sv, vmean, n_pad
 
     def run(self, qq, kk, vv, out, causal, sm_scale, smooth_k, contiguous_hnd):
-        """qq/kk/vv: logical (B, H, N, D) views the caller's envelope accepted (`strided_view_reason`); `out` the
-        (B*H, N, D) buffer for contiguous HND, else the logical (B, H, N, D) view to write, allocated by the caller.
+        """qq: logical (B, H, Nq, D), kk/vv (B, H, Nk, D) views the caller's envelope accepted
+        (`strided_view_reason`); `out` the (B*H, Nq, D) buffer for contiguous HND, else the logical (B, H, Nq, D) view
+        to write, allocated by the caller.
         `out` is written in place. Both objects take the same arguments, so they are built once."""
-        B, H, N, D = (int(x) for x in qq.shape)
+        B, H, Nq, D = (int(x) for x in qq.shape)
+        Nk = int(kk.size(2))
         fns = self.functions(qq.dtype, not contiguous_hnd)   # load (or fail) before any prologue work
         st = torch_stream()
         k8, sk, v8t, sv, vmean, n_pad = self.prologue(kk, vv, smooth_k, st)
         P, I = ctypes.c_void_p, ctypes.c_int
         args = [P(qq.data_ptr()), P(k8.data_ptr()), P(sk.data_ptr()), P(v8t.data_ptr()), P(sv.data_ptr()),
-                P(vmean.data_ptr()), P(out.data_ptr()), I(H), I(N), I(n_pad), ctypes.c_float(float(sm_scale))]
+                P(vmean.data_ptr()), P(out.data_ptr()), I(H), I(Nq), I(Nk), I(n_pad), ctypes.c_float(float(sm_scale))]
         if not contiguous_hnd:
             args += [I(x) for x in _strided_triple(qq, "q")[:3] + _strided_triple(out, "out")[:3]]
-        grid = ((N + 127) // 128, H, B)
+        grid = ((Nq + 127) // 128, H, B)
         launches = [self.rt.launch(f[1] if causal else f[0], grid, (256, 1, 1), 0, st, args)
                     for f in fns]
         # the argument storage must outlive the asynchronous launches

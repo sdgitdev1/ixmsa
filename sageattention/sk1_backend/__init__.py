@@ -218,7 +218,7 @@ ENVELOPE = dict(
     causal=(0, 1),
     smooth_k=(False, True),
     batch_heads="any",
-    seq_len="N >= 1",
+    seq_len="N >= 1; non-causal calls with the int8 P.V objects may have more or fewer keys than queries",
     return_lse=False,
     attn_mask=False,
     smooth_v=False,
@@ -577,7 +577,7 @@ def _try_i8pv(qq, kk, vv, tensor_layout, contiguous_hnd, is_causal, sm, smooth_k
     """`(out, None)` from the int8 P.V objects, or `(None, reason)` for the caller to fall through. Raises
     only when `strict`."""
     from . import i8pv
-    why = i8pv.refusal(qq, sm)
+    why = i8pv.refusal(qq, kk, sm)
     if why is not None:
         if strict:
             raise RuntimeError("the int8 P.V objects cannot serve this call (%s)" % why)
@@ -759,13 +759,10 @@ def _envelope_ok(q, k, v, tensor_layout, is_causal, sm_scale, return_lse, smooth
         return "batch"
     if q.size(1) != k.size(1) or q.size(1) != v.size(1):
         return "heads"
-    # the kernel takes a single `N` from `q`: a longer K would be silently truncated and a shorter
-    # K would read out of bounds
-    if q.size(2) != k.size(2):
+    if k.size(2) != v.size(2) or q.size(2) < 1 or k.size(2) < 1:
         return "seq_len"
-    if k.size(2) != v.size(2):
-        return "seq_len"
-    if q.size(2) < 1 or k.size(2) < 1:
+    # the causal kernels put the diagonal at query row = key index
+    if is_causal and q.size(2) != k.size(2):
         return "seq_len"
     return None
 
@@ -857,6 +854,10 @@ def try_sk1_t1(q, k, v, *, tensor_layout="HND", is_causal=False, sm_scale=None, 
                            v_strict)
         if out is not None:
             return out, None
+    # the objects below take a single `N` from `q`: a longer K would be silently truncated and a shorter K would
+    # read out of bounds
+    if qq.size(2) != kk.size(2):
+        return None, "seq_len"
     if int8 is None:
         want_i8, i8_strict = bool(SK1_INT8), bool(SK1_INT8_STRICT)
     else:

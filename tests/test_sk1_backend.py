@@ -356,3 +356,67 @@ def test_i8pv_failed_load_keeps_no_inputs_alive(monkeypatch):
     gc.collect()
     assert all(r() is None for r in refs)
     assert isinstance(sk1._I8PV["gfx1201"], str)
+
+
+def _unequal_qkv(nq, nkv, h=4, seed=11, layout="HND", dtype=torch.float16):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    def make(n):
+        shape = (1, h, n, HEAD_DIM) if layout == "HND" else (1, n, h, HEAD_DIM)
+        return torch.randn(shape, device="cuda", dtype=dtype, generator=g)
+    return make(nq), make(nkv), make(nkv)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("layout", ["HND", "NHD"])
+@pytest.mark.parametrize("nq, nkv", [(4096, 4223), (1, 300), (128, 129), (4097, 8771), (8771, 4096), (300, 129)])
+def test_i8pv_q_and_kv_lengths_differ(nq, nkv, layout, dtype):
+    from sageattention.sk1_backend import try_sk1_t1
+    q, k, v = _unequal_qkv(nq, nkv, layout=layout, dtype=dtype)
+    out, why = try_sk1_t1(q, k, v, tensor_layout=layout)
+    assert why is None
+    assert out.shape == q.shape
+    if layout == "NHD":
+        out, q, k, v = (t.transpose(1, 2) for t in (out, q, k, v))
+    assert _rel_rms(out, _reference(q, k, v, False)) < MAX_REL_RMS
+
+
+def test_causal_with_unequal_lengths_is_refused():
+    from sageattention.sk1_backend import try_sk1_t1
+    q, k, v = _unequal_qkv(128, 256)
+    assert try_sk1_t1(q, k, v, tensor_layout="HND", is_causal=True) == (None, "seq_len")
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_unequal_lengths_fall_back_without_the_i8pv_objects(dtype):
+    from sageattention.sk1_backend import try_sk1_t1
+    q, k, v = _unequal_qkv(512, 900, dtype=dtype)
+    assert try_sk1_t1(q, k, v, tensor_layout="HND", i8pv=False) == (None, "seq_len")
+    out = _sageattn()(q, k, v, tensor_layout="HND", sk1_i8pv=False)
+    assert _rel_rms(out, _reference(q, k, v, False)) < MAX_REL_RMS
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_qwen_prefix_views(dtype):
+    # Qwen Image 2.1 attends target queries over [cached prefix, target]: q is a view into a fused projection,
+    # k and v a concatenation, both NHD
+    from sageattention.sk1_backend import try_sk1_t1
+    g = torch.Generator(device="cuda").manual_seed(13)
+    h, n, pre = 24, 4096, 900
+    qkv = torch.randn(1, n, 3, h, HEAD_DIM, device="cuda", dtype=dtype, generator=g)
+    q = qkv[:, :, 0]
+    prefix = torch.randn(1, pre, 2, h, HEAD_DIM, device="cuda", dtype=dtype, generator=g)
+    k = torch.cat([prefix[:, :, 0], qkv[:, :, 1]], dim=1)
+    v = torch.cat([prefix[:, :, 1], qkv[:, :, 2]], dim=1)
+    out, why = try_sk1_t1(q, k, v, tensor_layout="NHD")
+    assert why is None
+    ref = _reference(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), False)
+    assert _rel_rms(out.transpose(1, 2), ref) < MAX_REL_RMS
+
+
+def test_long_query_grid():
+    from sageattention.sk1_backend import try_sk1_t1
+    q, k, v = _unequal_qkv(70000, 512, h=2)
+    out, why = try_sk1_t1(q, k, v, tensor_layout="HND")
+    assert why is None
+    for rows in (slice(0, 256), slice(70000 - 256, 70000)):
+        assert _rel_rms(out[:, :, rows], _reference(q[:, :, rows], k, v, False)) < MAX_REL_RMS

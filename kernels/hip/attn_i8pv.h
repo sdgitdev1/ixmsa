@@ -16,7 +16,8 @@
 // the tile flags at [128, 128 + nt), f_j at [128 + nt, 128 + 2 nt) and, in head 0's row only, the call flag (every
 // tile of the call took group scales) at 128 + 2 nt.
 // Q is quantised to int8 per token here. sm_scale must be positive (the max of scaled scores is taken as the
-// scaled max).
+// scaled max). Q and O have Nq rows, K and V Nk keys (N_pad = Nk rounded up to 64); the causal kernel needs
+// Nq == Nk.
 //
 // Per 64-key tile: S = Q.K in int32 (WMMA iu8), a row max, P = u8(exp2(s - (tile max - log2 255))) so every
 // tile uses the full byte range, the row sum from the same bytes (v_sad_u8), then O += (V^T P^T) in int32
@@ -95,7 +96,7 @@ template <bool CAUSAL>
 __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint8_t* __restrict__ K8,
                                           const float* __restrict__ SK, const uint8_t* __restrict__ V8T,
                                           const float* __restrict__ SV, const float* __restrict__ VMEAN,
-                                          qo_t* __restrict__ O, int H, int N, int N_pad, float sm_scale
+                                          qo_t* __restrict__ O, int H, int Nq, int Nk, int N_pad, float sm_scale
 #if I8PV_STRIDED
                                           , int q_rstride, int q_hstride, int q_bstride,
                                           int o_rstride, int o_hstride, int o_bstride
@@ -131,11 +132,11 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #if I8PV_STRIDED
   const qo_t* qp = Q + qbase + (size_t)qrow * (size_t)q_rstride + 8 * lh;
 #else
-  const qo_t* qp = Q + (bh * N + qrow) * HD + 8 * lh;
+  const qo_t* qp = Q + (bh * Nq + qrow) * HD + 8 * lh;
 #endif
 #pragma unroll
   for (int dt = 0; dt < 8; ++dt) {
-    if (qrow < N) {
+    if (qrow < Nq) {
       qh[dt] = *(const qo8_t*)(qp + 16 * dt);
     } else {
 #pragma unroll
@@ -255,8 +256,8 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
           skip = base > q0 + 15;
           need_mask = (j >= full);
         } else {
-          skip = base >= N;
-          need_mask = (base + 32 > N);
+          skip = base >= Nk;
+          need_mask = (base + 32 > Nk);
         }
       }
       skp[st] = skip;
@@ -319,7 +320,7 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #pragma unroll
           for (int e = 0; e < 8; ++e) {
             const int key = base + kk * 16 + 8 * lh + e;
-            if (CAUSAL ? (key > qrow) : (key >= N)) sc[st][kk][e] = -INFINITY;
+            if (CAUSAL ? (key > qrow) : (key >= Nk)) sc[st][kk][e] = -INFINITY;
           }
       }
 #pragma unroll
@@ -410,7 +411,7 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
       bias_i = 0.f;
     }
   };
-  const int j_int = min(j_hi, CAUSAL ? full : N / BN);
+  const int j_int = min(j_hi, CAUSAL ? full : Nk / BN);
   int j = 0;
 #if I8PV_MIX
   // interior tiles pick their scale kind per tile inside the body (see `dyn`)
@@ -426,7 +427,7 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #pragma unroll
     for (int e = 0; e < 8; ++e) acc[nt][e] -= bias_i;
   const float inv = l_i > 0.f ? 1.0f / l_i : 0.f;
-  if (qrow < N) {
+  if (qrow < Nq) {
 #pragma unroll
     for (int nt = 0; nt < 8; ++nt) {
       const int d0 = nt * 16 + 8 * lh;
@@ -449,7 +450,7 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #if I8PV_STRIDED
       *(qo8_t*)(O + obase + (size_t)qrow * (size_t)o_rstride + d0) = o;
 #else
-      *(qo8_t*)(O + (bh * N + qrow) * HD + d0) = o;
+      *(qo8_t*)(O + (bh * Nq + qrow) * HD + d0) = o;
 #endif
     }
   }
@@ -469,14 +470,14 @@ __device__ __forceinline__ void i8pv_body(const qo_t* __restrict__ Q, const uint
 #define I8PV_ARGS                                                                                   \
   const qo_t *__restrict__ Q, const uint8_t *__restrict__ K8, const float *__restrict__ SK,         \
       const uint8_t *__restrict__ V8T, const float *__restrict__ SV, const float *__restrict__ VMEAN, \
-      qo_t *__restrict__ O, int H, int N, int N_pad, float sm_scale I8PV_SARGS
+      qo_t *__restrict__ O, int H, int Nq, int Nk, int N_pad, float sm_scale I8PV_SARGS
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
 I8PV_CAT(I8PV_NAME, _fwd)(I8PV_ARGS) {
-  i8pv_body<false>(Q, K8, SK, V8T, SV, VMEAN, O, H, N, N_pad, sm_scale I8PV_SPASS);
+  i8pv_body<false>(Q, K8, SK, V8T, SV, VMEAN, O, H, Nq, Nk, N_pad, sm_scale I8PV_SPASS);
 }
 
 extern "C" __global__ void __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
 I8PV_CAT(I8PV_NAME, _fwd_causal)(I8PV_ARGS) {
-  i8pv_body<true>(Q, K8, SK, V8T, SV, VMEAN, O, H, N, N_pad, sm_scale I8PV_SPASS);
+  i8pv_body<true>(Q, K8, SK, V8T, SV, VMEAN, O, H, Nq, Nk, N_pad, sm_scale I8PV_SPASS);
 }
