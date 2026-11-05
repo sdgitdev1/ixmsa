@@ -1680,3 +1680,11 @@ __F178_RENDER__
 **Result.** Called as comfy-kitchen's fp8 linear calls it (x contiguous, the weight as a transposed view, bf16 out), comfy-kitchen 0.2.41, interleaved: at M = 8462 the hipBLASLt time over comfy-kitchen's is 0.79 / 0.79 / 0.76 for K × N = 6144 × 6144, 6144 × 18432 and 6144 × 16384 (~228 against ~180 TFLOPS); at M = 4096 0.79–0.91 for K from 3072 to 14336, and at M = 512 0.78–0.97. The exception is K = 16384: 1.12–1.82× slower (100–116 TFLOPS, the shape F175 splits in two), and K = 24576 is 1.07× slower, while K = 20480 is 0.89×. The two agree to 3·10⁻⁵ relative. The node now sends calls with K ≥ 16384 to comfy-kitchen's kernel and the rest to hipBLASLt. Splitting those calls into two contiguous K halves through hipBLASLt instead, as F175 does, with the copies of the halves counted, takes 0.97–2.07× comfy-kitchen's time across M = 512–8462 (fp32 halves summed: 1.05–2.07×), so the split is not used there. Krea2 Turbo's only K = 16384 layers are its full-precision `mlp.down`, which the node routes to `fp8_linear` (F175) anyway; the split matters for checkpoints that quantize those layers, or with `COMFYUI_FP8_UNIFORM_QUANT=1`.
 
 **Status:** v0.6.0, `comfyui/ComfyUI-ROCm-FP8-Fastpath`.
+
+### F181 — Skipping tiles that barely contribute <sub>(research)</sub>
+
+**Question.** If a kernel skipped the 64-key tiles whose scores are far below every row's max in a 128-query block, how much work would it save on real activations, and at what error?
+
+**Result.** Measured with exact scores on the 18 captures, so this is the best case: a kernel would have to predict these tiles before computing Q·K. A tile counts as skippable when every row of the block has its largest weight in that tile below 2^-k of its row's largest. Over all captures 10.2 % of (block, tile) pairs are skippable at k = 8, 3.0 % at k = 12 and 0.9 % at k = 16. On Krea2's 8771-token blocks k = 8 skips 2–25 % (median about 9 %) but adds a relative error of 0.4–3.4·10⁻³, the size of the kernel's whole error (0.0041 median); k = 12 adds 1·10⁻⁵–1.4·10⁻⁴ but skips 0.3–9.7 % (median about 2.5 %). Flux2-Klein's 1056-token captures have no skippable tile at any k.
+
+**Status:** refuted for these models: the share that can be skipped without adding error is a few percent at best, before the cost of predicting it.
