@@ -1688,3 +1688,11 @@ __F178_RENDER__
 **Result.** Measured with exact scores on the 18 captures, so this is the best case: a kernel would have to predict these tiles before computing Q·K. A tile counts as skippable when every row of the block has its largest weight in that tile below 2^-k of its row's largest. Over all captures 10.2 % of (block, tile) pairs are skippable at k = 8, 3.0 % at k = 12 and 0.9 % at k = 16. On Krea2's 8771-token blocks k = 8 skips 2–25 % (median about 9 %) but adds a relative error of 0.4–3.4·10⁻³, the size of the kernel's whole error (0.0041 median); k = 12 adds 1·10⁻⁵–1.4·10⁻⁴ but skips 0.3–9.7 % (median about 2.5 %). Flux2-Klein's 1056-token captures have no skippable tile at any k.
 
 **Status:** refuted for these models: the share that can be skipped without adding error is a few percent at best, before the cost of predicting it.
+
+### F180 — Fewer queries than keys: Qwen Image 2.1's cached prefix <sub>(v0.6)</sub>
+
+**Question.** Qwen Image 2.1 caches the text prefix's K and V and attends the image tokens over [prefix, image], so its calls have more keys than queries, and every one fell back to PR #368's path (`reason="seq_len"`). Can the int8 P·V kernels take them?
+
+**Result.** The kernels took one length for both; they now take the query length for Q rows and the output, and the key length for key tiles, the boundary mask and the prologue (one more kernel argument, the same VGPR count, no spills). Non-causal calls may have any query length from 1 against at least 129 keys; a causal call with unequal lengths is still refused, and the older objects still refuse unequal lengths. Equal-length outputs are bit-identical to before on all 126 checked cells (18 captures and random shapes, fp16 and bf16, HND and NHD, causal), and comfy-kitchen's time over this package's on equal lengths is unchanged (fp16 HND 1.024 / 1.020 / 1.020). On Qwen-shaped calls (NHD, H = 24, 4096 or 8192 queries over 300–1200 more keys) this package takes 0.63–0.69 of PR #368's time, with relative error 0.015 against PR #368's 0.039. In a Qwen Image 2.1 render (int8 checkpoint, 1024 × 1024, 8 steps), all 64 prefix calls of a 2-step run are served, and the sampler goes from 1.85 / 1.86 to 2.10 / 2.11 it/s, 12 % less time per step.
+
+**Status:** v0.6.0.
