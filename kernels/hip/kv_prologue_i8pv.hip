@@ -2,7 +2,11 @@
 //
 //   kv_prologue_i8pv_stats1_{f16,bf16} grid (B*H), block 256: the K mean (from every `step`-th row; the caller picks
 //                                      ~1024 rows), the V mean and the per-channel V scale s_d = max|v - vmean| / 127
-//                                      (from every row); sets the call flag (head 0's SV[128 + 2 nt]) to 1.
+//                                      (from every row); sets the call flag (head 0's SV[128 + 2 nt]) to 1; and
+//                                      the head's rotation flag SV[129 + 2 nt]: 1 when K's largest channel range (over
+//                                      the same sampled rows) is under 16x the median one. Heads with one dominant K
+//                                      channel lose accuracy to the rotation (Q's matching channel is large too).
+//                                      K is quantised after a 128-point Hadamard rotation on flagged heads.
 //   kv_prologue_i8pv_quant_{f16,bf16}  grid (N_pad/64, B*H), block 256: one 64-key tile per block.
 //       K: k - kmean, per-token amax. A 16-key group's scale is the group max; the tile takes group scales if every
 //          live key's amax is >= TAU * its group max (a group scale then costs any key at most log2(1/TAU) bits),
@@ -12,7 +16,7 @@
 //          V8T = rint(... / f_j) clamped to [-127, 127], stored transposed (BH, 128, N_pad).
 //
 // K and V may be any view with unit stride along the head dim (strided HND, NHD, fused QKV); padding rows get
-// K8 = 0, SK = 1, V8T = 0. SV must hold N_pad >= 129 + 2 nt floats per head (true for N >= 129).
+// K8 = 0, SK = 1, V8T = 0. SV must hold N_pad >= 130 + 2 nt floats per head (true for N >= 129).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 
@@ -71,9 +75,13 @@ __device__ __forceinline__ void stats1_body(const T* __restrict__ K, const T* __
   const int h = (int)(bh - (long long)b * H);
   const long long kb = (long long)b * k_sb + (long long)h * k_sh + 8 * tx;
   const long long vb_ = (long long)b * v_sb + (long long)h * v_sh + 8 * tx;
-  float ks[8], kc[8], vs[8], vc[8], mx[8], mn[8];
+  float ks[8], kc[8], vs[8], vc[8], mx[8], mn[8], kmx[8], kmn[8];
   #pragma unroll
-  for (int t = 0; t < 8; t++) { ks[t] = kc[t] = vs[t] = vc[t] = 0.f; mx[t] = -INFINITY; mn[t] = INFINITY; }
+  for (int t = 0; t < 8; t++) {
+    ks[t] = kc[t] = vs[t] = vc[t] = 0.f;
+    mx[t] = kmx[t] = -INFINITY;
+    mn[t] = kmn[t] = INFINITY;
+  }
   // V: every row (its channel max sets the V scale, and a missed outlier would cost its tile 5 bits).
   // K: every `step`-th row; any K mean is exact for attention, so a sample only changes the K ranges.
   for (long long n = ty; n < N; n += 16) {
@@ -90,7 +98,11 @@ __device__ __forceinline__ void stats1_body(const T* __restrict__ K, const T* __
     float kx[8];
     load8<T>(K + kb + n * k_sr, kx);
     #pragma unroll
-    for (int t = 0; t < 8; t++) nsum(ks[t], kc[t], kx[t]);
+    for (int t = 0; t < 8; t++) {
+      nsum(ks[t], kc[t], kx[t]);
+      kmx[t] = fmaxf(kmx[t], kx[t]);
+      kmn[t] = fminf(kmn[t], kx[t]);
+    }
   }
   #pragma unroll
   for (int t = 0; t < 8; t++) {
@@ -110,6 +122,35 @@ __device__ __forceinline__ void stats1_body(const T* __restrict__ K, const T* __
     VMEAN[(long long)bh * HD + d] = mu;
     if (d == 0 && bh == 0) SV[HD + 2 * (N_pad / BN)] = 1.0f;
     SV[(long long)bh * N_pad + d] = __fdiv_rn(fmaxf(fmaxf(m1 - mu, mu - m0), 1e-8f), 127.0f);
+  }
+  // the rotation flag: K's largest channel range against the median one (the lower of the middle two)
+  __shared__ float krg[HD], kmed;
+  __syncthreads();
+  #pragma unroll
+  for (int t = 0; t < 8; t++) {
+    rmx[ty][8 * tx + t] = kmx[t];
+    rmn[ty][8 * tx + t] = kmn[t];
+  }
+  __syncthreads();
+  if (threadIdx.x < HD) {
+    const int d = threadIdx.x;
+    float m1 = -INFINITY, m0 = INFINITY;
+    for (int i = 0; i < 16; i++) { m1 = fmaxf(m1, rmx[i][d]); m0 = fminf(m0, rmn[i][d]); }
+    krg[d] = m1 - m0;
+    if (d == 0) kmed = 0.f;   // stays 0 (no rotation) if non-finite K leaves no element at the middle rank
+  }
+  __syncthreads();
+  if (threadIdx.x < HD) {
+    const int d = threadIdx.x;
+    int rank = 0;
+    for (int i = 0; i < HD; i++) rank += (krg[i] < krg[d]) || (krg[i] == krg[d] && i < d);
+    if (rank == HD / 2 - 1) kmed = krg[d];
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float kpk = 0.f;
+    for (int i = 0; i < HD; i++) kpk = fmaxf(kpk, krg[i]);
+    SV[(long long)bh * N_pad + HD + 2 * (N_pad / BN) + 1] = kpk < 16.0f * kmed ? 1.0f : 0.0f;
   }
 }
 
@@ -170,6 +211,28 @@ __device__ __forceinline__ void quant_body(const T* __restrict__ K, const T* __r
         kv[j * 8 + t] = live ? (kv[j * 8 + t] - MEAN[(long long)bh * HD + col]) : 0.0f;
       }
     }
+  }
+  if (SV[(long long)bh * N_pad + HD + 2 * nt + 1] != 0.0f) {
+    // the orthonormal 128-point Hadamard rotation of k - kmean (the attention kernel rotates this head's Q the same
+    // way). A thread holds dims 32 j + 8 q + t: the t and j bits rotate in registers, the q bits across the row's lanes.
+    #pragma unroll
+    for (int s = 1; s < 32; s <<= 1)
+      #pragma unroll
+      for (int i = 0; i < 32; i++)
+        if (!(i & s)) {
+          const float a = kv[i], c = kv[i + s];
+          kv[i] = a + c;
+          kv[i + s] = a - c;
+        }
+    #pragma unroll
+    for (int m = 1; m < 4; m <<= 1)
+      #pragma unroll
+      for (int i = 0; i < 32; i++) {
+        const float o = __shfl_xor(kv[i], m, 32);
+        kv[i] = (q & m) ? o - kv[i] : kv[i] + o;
+      }
+    #pragma unroll
+    for (int i = 0; i < 32; i++) kv[i] *= 0.08838834764831845f;
   }
   float kmax = 0.0f;
   #pragma unroll

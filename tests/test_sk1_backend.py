@@ -420,3 +420,40 @@ def test_long_query_grid():
     assert why is None
     for rows in (slice(0, 256), slice(70000 - 256, 70000)):
         assert _rel_rms(out[:, :, rows], _reference(q[:, :, rows], k, v, False)) < MAX_REL_RMS
+
+
+def _spread_k_qkv(dtype, sigma=0.6, h=4, n=2048, seed=21):
+    # K channels with scales spread by exp(N(0, sigma)): what the 128-point rotation of Q and K is for
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q, k, v = (torch.randn(1, h, n, HEAD_DIM, device="cuda", generator=g) for _ in range(3))
+    k = k * torch.exp(sigma * torch.randn(1, h, 1, HEAD_DIM, device="cuda", generator=g)) * 2
+    return q.to(dtype), k.to(dtype), v.to(dtype)
+
+
+def _rotate_flags(k, v):
+    from sageattention.sk1_backend import i8pv
+    from sageattention.sk1_backend.sk1_loader import torch_stream
+    rt = i8pv.I8pv("gfx1201")
+    _, _, _, sv, _, n_pad = rt.prologue(k, v, True, torch_stream())
+    return sv[:, HEAD_DIM + 2 * (n_pad // 64) + 1].tolist()
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_rotation_cuts_error_with_spread_k_channels(dtype):
+    q, k, v = _spread_k_qkv(dtype)
+    assert _rotate_flags(k, v) == [1.0] * 4
+    out = _sageattn()(q, k, v, tensor_layout="HND")
+    assert _rel_rms(out, _reference(q, k, v, False)) < 0.033
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_head_with_a_dominant_k_channel_is_not_rotated(dtype):
+    q, k, v = _spread_k_qkv(dtype, sigma=0.0)
+    k[:, 1, :, 7] *= 60
+    assert _rotate_flags(k, v) == [1.0, 0.0, 1.0, 1.0]
+    out = _sageattn()(q, k, v, tensor_layout="HND")
+    ref = _reference(q, k, v, False)
+    err = [_rel_rms(out[:, i], ref[:, i]) for i in range(4)]
+    # head 1 keeps the 0.32 it had before the rotation (K's int8 scale is set by channel 7); a head whose Q and K
+    # were rotated differently would be near 1
+    assert max(err[0], err[2], err[3]) < 0.033 and err[1] < 0.4

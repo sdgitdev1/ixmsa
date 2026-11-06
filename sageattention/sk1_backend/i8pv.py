@@ -10,7 +10,7 @@ names. The one the call flag does not pick returns at once, so the call runs as 
 split a call's heads leave two partly idle tails.
 
 Contract: fp16 or bf16, head_dim 128, sm_scale > 0, q a logical (B, H, Nq, D) view and k/v (B, H, Nk, D) views
-that `strided_view_reason` accepts, N_pad >= 129 + 2 * N_pad / 64 for N_pad = Nk rounded up to 64 (Nk >= 129), and
+that `strided_view_reason` accepts, N_pad >= 130 + 2 * N_pad / 64 for N_pad = Nk rounded up to 64 (Nk >= 129), and
 Nq == Nk for a causal call. Nq may be anything from 1.
 """
 from __future__ import annotations
@@ -44,7 +44,7 @@ def refusal(q, k, sm_scale):
     if not sm_scale > 0:
         return "i8pv_scale"
     n_pad = (int(k.size(2)) + BN - 1) // BN * BN
-    if n_pad < HD + 2 * (n_pad // BN) + 1:
+    if n_pad < HD + 2 * (n_pad // BN) + 2:
         return "i8pv_short"
     return None
 
