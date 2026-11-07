@@ -232,10 +232,10 @@ bf16 kernel, then PR #368's.
 | `SAGEATTN_SK1_BACKEND=0` | never use them |
 | `SAGEATTN_SK1_BACKEND=1` | strict: raise instead of falling back when the kernels cannot load or the GPU is not `gfx1201` |
 | `SAGEATTN_SK1_I8PV` unset | default: the int8 P·V kernels first, v0.5's kernels for a call they do not take |
-| `SAGEATTN_SK1_I8PV=0` | v0.5's kernels only, bit-identical to v0.5.0 |
-| `SAGEATTN_SK1_I8PV=1` | strict: raise for a call the int8 P·V kernels cannot serve (head_dim 64, under 129 keys, causal with unequal lengths, `sm_scale <= 0`) or when they fail to load |
+| `SAGEATTN_SK1_I8PV=0` | v0.5's kernels only, bit-identical to v0.5.0 for calls with `smooth_k` on |
+| `SAGEATTN_SK1_I8PV=1` | strict: raise for a call the int8 P·V kernels cannot serve (head_dim 64, under 129 keys, `sm_scale <= 0`) or when they fail to load |
 | `SAGEATTN_SK1_INT8` unset | default: int8 Q·K for fp16 calls |
-| `SAGEATTN_SK1_INT8=0` | fp8 Q·K for fp16 calls, bit-identical to v0.1.0 (this also skips the int8 P·V kernels for fp16) |
+| `SAGEATTN_SK1_INT8=0` | fp8 Q·K for fp16 calls, bit-identical to v0.1.0 for calls with `smooth_k` on (this also skips the int8 P·V kernels for fp16) |
 | `SAGEATTN_SK1_INT8=1` | strict: raise instead of falling back when the int8 kernel is missing or fails to load, or for a head_dim 64 call |
 | `SAGEATTN_SK1_BF16` unset | default: bf16 calls use the hand-written kernel |
 | `SAGEATTN_SK1_BF16=0` | bf16 calls go to PR #368's path, as in v0.1.0 |
