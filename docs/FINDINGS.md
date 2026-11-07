@@ -1633,6 +1633,10 @@ Error against the fp32 product on the inputs captured from a Krea2 render (block
 
 End to end (Krea2 Turbo fp8_scaled, 1672×1256, 8 steps, v0.6 attention, the layers routed by a patch node; 768 calls served per render, none refused): 2.38 / 2.36 s per step without, 2.12 / 2.12 with; a later interleaved pair gave 2.43 / 2.47 against 2.14 / 2.12.
 
+ComfyUI also keeps every fp8 layer of a text encoder at full precision, on purpose. One Krea2 text encode (Qwen3-VL-4B fp8_scaled, the model already on the GPU) takes 0.20 s against 15.8 s of sampling for 8 steps at 1672×1256, 1.2 % of a generation, so per-token fp8 is not offered there. Wall-clock encode times inside a ComfyUI session are dominated by moving the text encoder and the diffusion model in and out of VRAM, which per-token fp8 would not change.
+
+TunableOp on the node's fp8 GEMM (legacy `_scaled_mm`), at most 10 timed iterations per candidate: tuning one shape at one M takes 2–147 s at Krea2's K × N = 6144 × 6144 and 6144 × 18432, an M one higher tunes again (56 and 147 s), and the tuned kernels take 0.956–1.010 of hipBLASLt's default time. With several GEMM shapes per resolution that is minutes of tuning for at most a few percent of GEMM time, so the README has no TunableOp recipe.
+
 Testing before release found three defects, each fixed with a test: the rescale pass put the rows on the grid's y axis, which stops at 65535, so from 65536 tokens (video models) the remaining rows were left unscaled (relative error 0.71 at 70000 rows, no error raised); a NaN in x came out as finite values, because `fminf` / `fmaxf` clamped it to −448; and an input that needs a gradient came back detached. Rows are now on x, the clamp keeps NaN, and calls autograd has to see through return `None`. The code object is also loaded per device rather than per architecture. The Krea2 latent is bit-identical before and after.
 
 **Status:** v0.6, `sageattention.fp8_linear` (object `fp8_rowquant`). A library function: `sageattn` does not call it.
@@ -1708,3 +1712,29 @@ Error against fp64 on the 18 captures, fp16: median 0.0072 → 0.0043 (comfy-kit
 The rotation costs nothing in the prologue, but the kernels with it were 3–4 % slower per key tile, with the same instruction count in the KV loop. The same source without the rotation call compiles to the old loop exactly; with it, clang schedules and allocates the loop differently. Scheduler switches, an LDS-free lane exchange, a select instead of a branch, and an out-of-line rotation (1–2 %) did not recover it. The kernel's two equivalent forms of the K/V staging and the epilogue recovered most of it: the fused staging in every object, the hoisted-load epilogue in the contiguous objects and the guarded one in the strided objects. With those, the call costs 1–2 % more than before on all-group calls (most at 4096 tokens), and mixed calls 0–0.4 %. comfy-kitchen's time over this package's, A/A within 0.3 %: fp16 HND 1.001 / 1.011 / 1.013, bf16 HND 1.002 / 1.005 / 1.008 at N = 4096 / 8771 / 16384 (before: 1.023 / 1.019 / 1.020 and 1.014 / 1.015 / 1.018); fp16 NHD 0.992 / 1.048 / 1.041 (1.015 / 1.058 / 1.045); MiniMax-H3's fused views 1.033 / 1.031 / 1.025 (1.042 / 1.041 / 1.033); Krea2's real 8771-token calls, median 1.006 in fp16 (0.998–1.008) and 1.000 in bf16 (0.997–1.005); through ComfyUI's attention functions on Krea2's shapes 1.024 / 1.025.
 
 **Status:** v0.6.0.
+
+### F183 — Which attention calls still bypass the kernels <sub>(research)</sub>
+
+**Question.** ComfyUI sends masked attention calls to PyTorch before `sageattn` sees them, and `sageattn` refuses some shapes. In the models this package targets, how much attention time is left outside its kernels, and would mask support be worth adding?
+
+**Result.** Counted in 2-step runs of Krea2 Turbo (1672 × 1256) and Qwen Image 2.1 (1024 × 1024), each class of call timed on tensors of its logged shape and multiplied by its count. Neither model has a refused call. Krea2's 56 diffusion-model calls and 8 short text calls are served; the only calls outside are the text encoder's 36 masked calls (201 tokens, 32 query heads over 8 key heads, float mask), 2.4 % of attention time in 2 steps and about 0.6 % in an 8-step render. Qwen Image 2.1's 64 image calls are served (F180); outside are the text encoder's 72 masked calls (184 and 23 tokens) and 32 causal calls over the 170-token text prefix, which run once per generation: 13.3 % of attention time in 2 steps, about 3.7 % in 8, almost all of it text-encoder calls with grouped heads and float masks. Flux2 Klein's int8 checkpoint does not load in the ComfyUI version tested, so it was not counted.
+
+**Status:** research; nothing ships. Mask support would need key padding and grouped heads to reach those calls, for under 5 % of attention time in either model.
+
+### F184 — Coarser V scales <sub>(research)</sub>
+
+**Question.** The int8 P·V kernels scale V per channel and per 64-key tile (`f_j`, F174). With per-channel scales only, the per-tile factor goes. How much faster would that be?
+
+**Result.** The tile factor costs one uniform load and one multiply per 64-key tile, against about 500 instructions per tile in the KV loop. A knockout that drops it (timing only; its output is wrong) changes the call time by −0.3 % in fp16 and +0.3–0.6 % in bf16 at 8771 and 16384 tokens, which is code-generation noise. Per-channel-only scales would also lose V precision in tiles with small values.
+
+**Status:** refuted; the bar was 2 % faster.
+
+### F185 — head_dim 64, and calls too short for any int8 path <sub>(v0.6)</sub>
+
+**Question.** head_dim 64 calls (SDXL, SD3, video models) still run PR #368's path. Would an int8 P·V kernel at head_dim 64 be worth building, and how do these calls compare with PyTorch's SDPA?
+
+**Result.** comfy-kitchen's `int8_attention` follows the design of this package's int8 P·V kernels, so its head_dim 64 path shows what such a kernel could do. On synthetic calls shaped like SDXL (10 heads at 4096 tokens, 20 at 1024), SD3 (24 at 4096) and video models (32 at 16384) it takes 0.73–0.97 of PR #368's time up to 4096 tokens but 0.997–1.014 at 16384, with 2.6× lower error (0.014 against 0.038). A kernel of that design would not be faster than PR #368 at every shape, so none was built.
+
+SDPA, though, is faster than every int8 path on short calls. Timed by wall clock with the whole device synchronized, head_dim 64 SDPA takes 0.19–0.79 of PR #368's time on cross-attention to 77 text tokens and on self-attention up to about 1000 tokens, and head_dim 128 SDPA takes 0.34–0.79 of this package's int8 kernels up to 512 tokens at 48 heads. For both head dims the int8 paths catch up at about 2.7·10⁹ for B·H·Nq·Nk·D. So on gfx12 a call below 2³¹, without `return_lse`, now runs SDPA. Against the previous routing, on NHD calls as ComfyUI passes them: SDXL's cross-attention takes 0.48–0.64 of the time when the GPU is the bottleneck (0.33–0.48 back to back), an SD3-like joint text call 0.62–0.81, head_dim 64 self-attention at 1024 tokens 0.78–0.81, head_dim 128 at 130 / 512 tokens 0.38–0.40 / 0.76–0.79, and Krea2's text-fusion calls 0.11–0.37. Relative error falls from 0.013–0.047 to 0.0002–0.0022 (the bf16 output's own rounding). Calls above the bar are unchanged. `SAGEATTN_SDPA_SHORT=0` keeps them on the int8 paths.
+
+**Status:** v0.6.0. No head_dim 64 int8 kernel.
