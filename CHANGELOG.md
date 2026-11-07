@@ -5,35 +5,56 @@ version identifier, so every wheel can be traced to the release it came from. Th
 summaries; [docs/FINDINGS.md](docs/FINDINGS.md) has the measurements behind them and
 [docs/METHOD.md](docs/METHOD.md) how they were taken.
 
-## Unreleased (v0.6)
+## v0.6.0 — 2.2.0+amd.gfx12.6
+
+**As fast as ComfyUI's own comfy-kitchen attention and more accurate, with a third of PR #368's error.**
 
 - **New default kernels: int8 Q·K and int8 P·V** (`attn_i8pv_*`, `kv_prologue_i8pv`) for fp16 and bf16, head_dim 128,
-  every layout, causal or not. Against comfy-kitchen's `int8_attention`, through `sageattn`: 0.98–0.99 of its time
-  on contiguous HND (fp16 and bf16, 4k to 16k tokens), 0.95–1.00 on NHD (counting the output copy ComfyUI makes for
-  it) and 0.96–0.97 on MiniMax-H3's fused views.
-  Against PR #368: 1.2–1.3× faster non-causal, 1.4–2.2× causal. Error on the 18 real captures: median 0.0072 in fp16
-  against PR #368's 0.0126 and v0.5's 0.0139, lower than PR #368's on all 18. It uses comfy-kitchen's lazy rescale and
-  kernel shape, one K scale per 16 keys on heads where that loses at most 2 bits per key (per-token scales on the
-  others, which keeps Krea2's outlier layers accurate), and a seeded Q·K accumulator (F174). bf16 now uses int8 Q·K too.
+  every layout, causal or not. comfy-kitchen's `int8_attention` takes 1.00–1.01× their time on contiguous HND (fp16
+  and bf16, 4k to 16k tokens), 1.00–1.05× on NHD (counting the output copy ComfyUI makes for it), 1.02–1.03× on
+  MiniMax-H3's fused views, and 1.02× through ComfyUI's own attention functions on Krea2's calls; on Krea2's real
+  8771-token activations the two are level. Against PR #368: 1.2–1.4× faster non-causal, 1.5–2.3× causal. Error on
+  the 18 real captures: median 0.0043 in fp16 against comfy-kitchen's 0.0049, PR #368's 0.0126 and v0.5's 0.0139,
+  lower than PR #368's on all 18. They use comfy-kitchen's lazy rescale and kernel shape, one K scale per 16 keys on
+  64-key tiles where that loses at most 2 bits per key (per-token scales on the others, which keeps Krea2's outlier
+  layers accurate), one launch per call and a seeded Q·K accumulator (F174, F177), and a 128-point Hadamard rotation
+  of Q and K on heads without one dominant K channel (F182). bf16 now uses int8 Q·K too. Their K/V statistics take
+  one launch, with the K mean from about 1024 sampled rows.
+- **Queries and keys may differ in length** in non-causal calls (any query length against at least 129 keys). Qwen
+  Image 2.1 attends over its cached text prefix that way, and those calls fell back to PR #368's path: they now take
+  0.63–0.69 of its time with 2.6× lower error, and its sampler runs 12 % faster (F180).
+- **Short calls go to PyTorch's SDPA.** Below 2³¹ multiply-adds per call (B·H·Nq·Nk·D) SDPA is faster on gfx12 than
+  any int8 path, and exact: SDXL's cross-attention takes 0.33–0.64 of its previous time, head_dim 128 calls of
+  130–512 tokens at 48 heads 0.38–0.79, Krea2's text-fusion calls 0.11–0.37 (F185). `SAGEATTN_SDPA_SHORT=0` keeps
+  them on the int8 paths.
 - **K is always smoothed.** Stock ComfyUI calls `sageattn(..., smooth_k=False)`, and without the key mean
   subtracted int8 K breaks on layers with extreme keys: Krea2's first block went from 0.008–0.015 relative error to
   0.20–0.36, on PR #368's path as well. The subtraction is exact and costs under 1 %, so `smooth_k=False` is now
   ignored on gfx12 (F176).
-- Their K/V statistics take one launch: V is read in full, the K mean comes from about 1024 sampled rows. Error on the
-  18 captures is unchanged.
 - **`sageattention.fp8_linear`**: an fp8 e4m3 linear with one activation scale per token (HIP quantize,
   `torch._scaled_mm`, HIP rescale; object `fp8_rowquant`), for the layers fp8_scaled checkpoints keep at full
   precision. 0.61–0.70× the time of dequantize + fp16 GEMM at Krea2's shapes, with the error of the checkpoint's other
-  fp8 layers; a Krea2 step at 1672×1256 goes from 2.38 s to 2.12 s when a node routes those layers to it (F175).
-  `sageattn` does not use it.
+  fp8 layers (F175). `sageattn` does not use it.
+- **A ComfyUI node for fp8_scaled checkpoints**, `comfyui/ComfyUI-ROCm-FP8-Fastpath`: comfy-kitchen's fp8 matmuls
+  through hipBLASLt (0.76–0.97 of the time of comfy-kitchen 0.2.41's own HIP kernel; K of 16384 and up stays on
+  comfy-kitchen's), dequantization from the contiguous weight, and the full-precision layers through `fp8_linear`.
+  It logs what it applied and skips any part whose ComfyUI interface changed (F179). A Krea2 Turbo step at 1672×1256
+  takes 2.03 s with the per-token layers against 2.27–2.29 s without, and the same with this package's attention as
+  with comfy-kitchen's (2.03 / 2.03 against 2.03 / 2.02 s).
+- The CPU cost of a call drops from about 100 to 72 µs, and the first long call in a Krea2 render takes 4–6 ms
+  instead of 93 ms (F178).
 - `SAGEATTN_SK1_I8PV=0` (or `sageattn(..., sk1_i8pv=False)`) turns the new kernels off; `SAGEATTN_SK1_INT8=0` does too
-  for fp16. head_dim 64, fewer than 129 tokens and `sm_scale <= 0` keep the previous objects.
+  for fp16. head_dim 64, fewer than 129 keys and `sm_scale <= 0` keep the previous objects. With the new kernels
+  off and `SAGEATTN_SDPA_SHORT=0`, output is bit-identical to v0.5.0 for calls with `smooth_k` on (the default).
+- Short calls: 0.29–0.63 of PR #368's time from 130 to 512 tokens at 48 heads (SDPA), 0.76–0.78 from 1024 to 4096
+  (v0.5: 0.77–1.03). The first call takes 0.02 s.
 - The unshipped head_dim 64 prologue path and two unused helpers are gone; the loader closes the
   code object file after reading it.
 - `tools/gfx1200_probe.py` now shows the object the device would actually load (it always printed
   the gfx1201 name).
 - A test guards v0.5's first-call fix: the default path must not import Triton.
-- With `SAGEATTN_SK1_I8PV=0`, output is bit-identical to v0.5.0.
+- Same two Windows wheels as v0.5.0: PyTorch `2.13.0+rocm10.0.0`, and PyTorch `2.14.0+rocm10.1.0`
+  with `-214-` in the name.
 
 ## v0.5.0 — 2.2.0+amd.gfx12.5
 

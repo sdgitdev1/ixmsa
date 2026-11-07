@@ -1673,7 +1673,7 @@ Knockouts of the group kernel at (1, 48, 8462, 128): without the Q·K WMMAs it t
 
 The first call in a render loads the code objects, and each load resolved the ROCm runtime's folder by enumerating every module loaded in the process: about 40 ms in ComfyUI, which loads hundreds. The folder is now looked up once, from the runtime module torch has already loaded (`GetModuleHandleW`), and the check that it is the same runtime as torch's runs only when read. The first long call in a Krea2 render drops from 93 to 4–6 ms; a first call in a fresh process spends 99 ms of CPU (was 265), most of it in torch's own first-use kernels.
 
-__F178_RENDER__
+In a full render (Krea2 Turbo fp8_scaled, 1672×1256, 8 steps, with the fp8 node, two renders each, interleaved) this package's attention and comfy-kitchen's take the same time per step: 2.03 / 2.03 s against 2.03 / 2.02 s.
 
 **Status:** v0.6.0.
 
