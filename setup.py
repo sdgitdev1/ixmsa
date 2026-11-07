@@ -46,7 +46,7 @@ from packaging.version import parse, Version
 
 from setuptools import setup, find_packages
 
-VERSION = "2.2.0+amd.gfx12.5"
+VERSION = "2.2.0+amd.gfx12.6"
 DIST_NAME = "sageattention"
 TARGET_TORCH = "2.13.0+rocm10.0.0"
 TARGET_ROCM = "7.15.26333"
