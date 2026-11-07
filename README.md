@@ -181,9 +181,11 @@ python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.6-cp312-cp312-win_
 python -m pip install --no-deps sageattention-2.2.0+amd.gfx12.6-214-cp312-cp312-win_amd64.whl   # PyTorch 2.14
 ```
 
-`python -c "import torch; print(torch.__version__)"` tells you which PyTorch you have. Both wheels
-compute bit-identical output; installed next to the wrong PyTorch, the import stops and names the
-version it needs. `--no-deps` keeps pip from touching your PyTorch install.
+`python -c "import torch; print(torch.__version__)"` tells you which PyTorch you have. The kernels
+in both wheels compute bit-identical output; calls short enough to run SDPA use PyTorch's own
+kernel, which can differ between the two PyTorch versions. Installed next to the wrong PyTorch, the
+import stops and names the version it needs. `--no-deps` keeps pip from touching your PyTorch
+install.
 
 ### Linux
 
