@@ -335,9 +335,9 @@ layers to it. A call it does not take (other dtypes, a per-channel scale, K or N
 ## A note from me
 
 I've been busy with my day job and haven't had much time for this. I think the kernel itself could
-still improve, but the returns are marginal now, and most of what is left is Triton and the HIP
-toolchain rather than the attention kernel. If I could, I'd ship this with my own libraries for both
-of them -- but testing and modifying them takes far too long on one GPU.
+still improve, but the returns are marginal now, and most of what is left is the HIP toolchain
+rather than the attention kernel. If I could, I'd ship this with my own build of it -- but testing
+and modifying it takes far too long on one GPU.
 
 I've built this with AI coding tools. They wrote most of the kernel code, ran the tests across
 the whole matrix and summarized the findings. I chose what to try, read the results and decided
