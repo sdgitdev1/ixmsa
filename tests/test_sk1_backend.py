@@ -119,6 +119,29 @@ def test_int8_is_the_fp16_default():
     assert _rel_rms(out_int8, ref) <= 1.05 * _rel_rms(out_fp8, ref)
 
 
+def test_short_calls_go_to_sdpa():
+    # Below 2^31 multiply-adds (B*H*Nq*Nk*D) a call is PyTorch's SDPA, bit for bit; larger calls stay on the kernels.
+    code = """
+        import torch
+        import torch.nn.functional as F
+        from sageattention import sageattn
+        g = torch.Generator(device="cuda").manual_seed(0)
+        r = lambda *s: torch.randn(*s, device="cuda", dtype=torch.float16, generator=g)
+        q, k, v = r(2, 10, 1024, 64), r(2, 10, 77, 64), r(2, 10, 77, 64)
+        cross = torch.equal(sageattn(q, k, v), F.scaled_dot_product_attention(q, k, v))
+        q, k, v = r(1, 300, 8, 128), r(1, 300, 2, 128), r(1, 300, 2, 128)
+        out = sageattn(q, k, v, tensor_layout="NHD", is_causal=True, sm_scale=0.1)
+        ref = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True,
+                                             scale=0.1, enable_gqa=True)
+        nhd = out.is_contiguous() and torch.equal(out, ref.transpose(1, 2))
+        q, k, v = r(1, 16, 1024, 128), r(1, 16, 1024, 128), r(1, 16, 1024, 128)
+        large = torch.equal(sageattn(q, k, v), F.scaled_dot_product_attention(q, k, v))
+        print("RESULT", cross, nhd, large)
+    """
+    assert _run_fresh(code, SAGEATTN_SDPA_SHORT="1") == ["True", "True", "False"]
+    assert _run_fresh(code, SAGEATTN_SDPA_SHORT="0") == ["False", "False", "False"]
+
+
 def test_int8_switch_off_gives_the_fp8_kernel():
     code = """
         import torch

@@ -185,6 +185,11 @@ else:
 #: the bf16 objects. `head_dim == 64` is a clean refusal (`bf16_d128_only`): both bf16 objects are
 #: D=128.
 
+#: Short calls go to PyTorch's SDPA. Below 2^31 multiply-adds per call (B*H*Nq*Nk*D) it takes less time on gfx12
+#: than any int8 path here, whose quantization and launches cost more than the attention itself, and it is exact
+#: (F185). `SAGEATTN_SDPA_SHORT=0` keeps those calls on the int8 paths.
+SDPA_SHORT = os.environ.get("SAGEATTN_SDPA_SHORT", "").strip().lower() not in ("0", "false", "no", "off")
+
 from typing import Any, List, Literal, Optional, Tuple, Union
 
 
@@ -1100,6 +1105,8 @@ def sageattn(
     - ``num_qo_heads`` must be divisible by ``num_kv_heads``.
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16`` or ``torch.bfloat16``
     - All tensors must be on the same cuda device.
+    - On gfx12, a call below 2^31 multiply-adds (B*H*Nq*Nk*D) without ``return_lse`` runs PyTorch's SDPA, which is
+      faster there and exact; ``SAGEATTN_SDPA_SHORT=0`` keeps it on the int8 paths.
 
     sk1_backend : Optional[bool]
         Control the **prebuilt SK1 backend** on the gfx12 path.  Default: ``None``, which reads the
@@ -1172,6 +1179,14 @@ def sageattn(
         # while int8 K without it loses layers whose keys share one direction: Krea2's first block goes
         # from 0.008-0.015 relative error to 0.20-0.36 (F176). Stock ComfyUI passes smooth_k=False.
         kwargs["smooth_k"] = True
+        if SDPA_SHORT and not return_lse and tensor_layout in ("HND", "NHD") and q.dtype in (torch.float16, torch.bfloat16):
+            hd = 1 if tensor_layout == "HND" else 2
+            nq, nk = q.size(3 - hd), k.size(3 - hd)
+            if q.size(0) * q.size(hd) * nq * nk * q.size(3) < 2 ** 31 and not (is_causal and nq != nk):
+                qh, kh, vh = (t if hd == 1 else t.transpose(1, 2) for t in (q, k, v))
+                out = F.scaled_dot_product_attention(qh, kh, vh, is_causal=is_causal, scale=sm_scale,
+                                                     enable_gqa=q.size(hd) != k.size(hd))
+                return out if hd == 1 else out.transpose(1, 2).contiguous()
         fast_path_keys = {"value_dtype", "smooth_k", "qk_quant_gran", "pv_accum_dtype", "smooth_v"}
         # ------------------------------------------------------------------ prebuilt SK1
         # ON by default, and the packaged object is `attn_fp8qk_f16` (the p*amax_v fp8 overflow of
