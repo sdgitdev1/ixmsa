@@ -405,7 +405,7 @@ setup(
         "sageattention.sk1_backend": ["*.hsaco", "*.py"],
     },
     include_package_data=True,
-    python_requires=">=3.12,<3.13",
+    python_requires=">=3.10,<3.14",
     install_requires=[f"torch=={_stamp_value('BUILD_TORCH', TARGET_TORCH)}"],
     ext_modules=ext_modules,
     cmdclass=cmdclass,
