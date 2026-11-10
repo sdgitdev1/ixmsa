@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
 
 env:
-  PYTORCH_ROCM_ARCH: "gfx1200;gfx1201"
-  GPU_ARCHS: "gfx1200;gfx1201"
-  SAGEATTN_LOCAL_VERSION: "IxMxAMARrocm10.1torch2.14.0"
+  PYTORCH_ROCM_ARCH: "gfx1201"
+  GPU_ARCHS: "gfx1201"
+  SAGEATTN_LOCAL_VERSION: "IxMxAMARrocm10.1torch2.14.0gfx1201"
   CC: "clang-cl"
   CXX: "clang-cl"
   CXXFLAGS: "-std=c++20"
