@@ -6,7 +6,7 @@ on:
 env:
   PYTORCH_ROCM_ARCH: "gfx1200;gfx1201"
   GPU_ARCHS: "gfx1200;gfx1201"
-  SAGEATTN_LOCAL_VERSION: "IxMxAMARrocm10.1torch2.14.0gfx120x"
+  SAGEATTN_LOCAL_VERSION: "IxMxAMAR.rocm10.1torch2.14.0gfx120x"
   CC: "clang-cl"
   CXX: "clang-cl"
   CXXFLAGS: "-std=c++20"
