@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
 
 env:
-  PYTORCH_ROCM_ARCH: "gfx1201"
-  GPU_ARCHS: "gfx1201"
-  SAGEATTN_LOCAL_VERSION: "IxMxAMARrocm10.1torch2.14.0gfx1201"
+  PYTORCH_ROCM_ARCH: "gfx1200;gfx1201"
+  GPU_ARCHS: "gfx1200;gfx1201"
+  SAGEATTN_LOCAL_VERSION: "IxMxAMARrocm10.1torch2.14.0gfx120x"
   CC: "clang-cl"
   CXX: "clang-cl"
   CXXFLAGS: "-std=c++20"
@@ -60,7 +60,7 @@ jobs:
           $setup_py = Get-Content setup.py -Raw
           $setup_py = $setup_py -replace 'c\+\+17', 'c++20'
           $setup_py = $setup_py -replace 'std:c\+\+17', 'std:c++20'
-          $setup_py = $setup_py -replace "(?m)^(\s*version\s*=\s*['""])([^'""]+)(['""].*)", "`$1`$2+$env:SAGEATTN_LOCAL_VERSION`$3"
+          $setup_py = $setup_py -replace "(?m)^(\s*version\s*=\s*['""])([^'""]+)(['""].*)", "`$1`$2.$env:SAGEATTN_LOCAL_VERSION`$3"
           Set-Content -Path setup.py -Value $setup_py
           Write-Host "Updated setup.py version line:"
           Select-String -Path setup.py -Pattern "version="
